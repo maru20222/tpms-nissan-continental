@@ -54,18 +54,16 @@ static Adafruit_ST7789* slotTft(int slot) {
     return (slot < 2) ? &tftL : &tftR;
 }
 
-// スロットラベル (LCD_SDEF_TO_SLOT 逆引き)
-static const char* SLOT_LABEL[4] = { "F.L A", "R.L D", "F.R B", "R.R C" };
+// スロットラベル
+static const char* SLOT_LABEL[4] = { "FL", "RL", "FR", "RR" };
 
 // ─── ヘルパー ─────────────────────────────────────────────────
 
-static uint16_t pressureColor(float bar, uint8_t alertCode, bool valid) {
+static uint16_t pressureColor(float kPa, bool valid) {
     if (!valid)           return COLOR_DARKGREY;
-    if (alertCode == 1)   return COLOR_RED;
-    if (alertCode == 2)   return COLOR_ORANGE;
-    if (alertCode == 3)   return COLOR_YELLOW;
-    if (bar < 1.8f)       return COLOR_RED;
-    if (bar > 3.5f)       return COLOR_ORANGE;
+    if (kPa < 140.0f)    return COLOR_RED;       // 低圧警告
+    if (kPa < 180.0f)    return COLOR_YELLOW;    // やや低め
+    if (kPa > 310.0f)    return COLOR_ORANGE;    // 高圧注意
     return COLOR_GREEN;
 }
 
@@ -76,23 +74,28 @@ static void drawSlot(int slot) {
     Adafruit_ST7789* tft = slotTft(slot);
     const int sy = SLOT_Y[slot];
 
-    // 対応する sdi を逆引き
-    int matchSdi = -1;
-    for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
-        if (LCD_SDEF_TO_SLOT[i] == slot) { matchSdi = i; break; }
-    }
-    const TireState& ts = (matchSdi >= 0) ? g_tireState[matchSdi] : g_tireState[0];
+    const TireState& ts = g_tireState[slot];
     const bool  valid   = ts.valid;
-    uint16_t colText = pressureColor(ts.bar, ts.alertCode, valid);
+    uint16_t colText = pressureColor(ts.kPa, valid);
 
     // 背景クリア (240×119、分割線1px分を除く)
     tft->fillRect(0, sy, 240, 119, COLOR_BLACK);
 
-    // ── ラベル行 ─────────────────────────────────────────────
+    // ── ラベル行 (位置名 + センサーID) ───────────────────────
     tft->setTextColor(COLOR_WHITE);
     tft->setTextSize(2);
     tft->setCursor(4, sy + 4);
     tft->print(SLOT_LABEL[slot]);
+
+    if (valid) {
+        // センサーID表示（左寄せ）
+        char idBuf[14];
+        snprintf(idBuf, sizeof(idBuf), "ID:%08X", ts.sensorId);
+        tft->setTextColor(COLOR_LIGHTGREY);
+        tft->setTextSize(2);
+        tft->setCursor(40, sy + 4);
+        tft->print(idBuf);
+    }
 
     if (!valid) {
         tft->setTextColor(COLOR_DARKGREY);
@@ -105,15 +108,7 @@ static void drawSlot(int slot) {
         return;
     }
 
-    // ── kPa (ラベル行右側) ───────────────────────────────────
-    char bufKpa[12];
-    snprintf(bufKpa, sizeof(bufKpa), "%3.0fkPa", ts.kPa);
-    tft->setTextColor(COLOR_LIGHTGREY);
-    tft->setTextSize(2);
-    tft->setCursor(168, sy + 4);
-    tft->print(bufKpa);
-
-    // ── 圧力 (bar) 大表示 ────────────────────────────────────
+    // ── 圧力 bar (大表示・中央) ──────────────────────────────
     char bufBar[12];
     dtostrf(ts.bar, 4, 2, bufBar);
     const char* pBar = bufBar;
@@ -121,34 +116,43 @@ static void drawSlot(int slot) {
 
     tft->setTextColor(colText);
     tft->setTextSize(5);
-    tft->setCursor(8, sy + 28);
+    // 中央寄せ: 1文字=30px幅(size5)、文字数に応じて調整
+    int barLen = (int)strlen(pBar);
+    int barX = (240 - barLen * 30) / 2;
+    if (barX < 4) barX = 4;
+    tft->setCursor(barX, sy + 28);
     tft->print(pBar);
 
     tft->setTextSize(2);
-    tft->setCursor(136, sy + 52);
+    tft->setCursor(barX + barLen * 30 + 4, sy + 52);
     tft->print("bar");
 
-    // ── 温度 ──────────────────────────────────────────────────
-    char bufTmp[12];
-    snprintf(bufTmp, sizeof(bufTmp), "%+d C", ts.tempC);
+    // ── kPa / 温度 (補助表示) ────────────────────────────────
+    char bufKpa[16];
+    snprintf(bufKpa, sizeof(bufKpa), "%.0fkPa", ts.kPa);
     tft->setTextColor(COLOR_CYAN);
-    tft->setTextSize(3);
-    tft->setCursor(8, sy + 80);
-    tft->print(bufTmp);
+    tft->setTextSize(2);
+    tft->setCursor(8, sy + 84);
+    tft->print(bufKpa);
 
-    // ── アラート / OK ─────────────────────────────────────────
-    const char* alertDisp = "OK";
-    uint16_t    alertCol  = COLOR_GREEN;
-    if      (ts.alertCode == 1) { alertDisp = "DEFL!";  alertCol = COLOR_RED; }
-    else if (ts.alertCode == 2) { alertDisp = "INFL!";  alertCol = COLOR_ORANGE; }
-    else if (ts.alertCode == 3) { alertDisp = "ALT?";   alertCol = COLOR_YELLOW; }
-    else if (ts.bar < 1.8f)     { alertDisp = "LOW P!"; alertCol = COLOR_RED; }
+    // 温度表示
+    char bufTemp[12];
+    snprintf(bufTemp, sizeof(bufTemp), "%3.0fC", ts.temperatureC);
+    tft->setTextColor(COLOR_LIGHTGREY);
+    tft->setCursor(160, sy + 84);
+    tft->print(bufTemp);
 
-    tft->setTextColor(alertCol);
-    tft->setTextSize(3);
-    int alertLen = strlen(alertDisp);
-    tft->setCursor(240 - alertLen * 18, sy + 80);
-    tft->print(alertDisp);
+    // ── ステータス ────────────────────────────────────────────
+    const char* statusDisp = "OK";
+    uint16_t    statusCol  = COLOR_GREEN;
+    if      (ts.kPa < 140.0f) { statusDisp = "LOW!";  statusCol = COLOR_RED; }
+    else if (ts.kPa < 180.0f) { statusDisp = "LOW";   statusCol = COLOR_YELLOW; }
+    else if (ts.kPa > 310.0f) { statusDisp = "HIGH";  statusCol = COLOR_ORANGE; }
+
+    tft->setTextColor(statusCol);
+    tft->setTextSize(2);
+    tft->setCursor(200, sy + 28);
+    tft->print(statusDisp);
 }
 
 // ─── 分割線描画 ───────────────────────────────────────────────
@@ -179,10 +183,10 @@ void lcdBegin() {
 
     // 初期状態設定
     const char* initialLabels[LCD_SENSOR_COUNT] = {
-        "R.L D",  // sdi=0
-        "F.L A",  // sdi=1
-        "F.R B",  // sdi=2
-        "R.R C",  // sdi=3
+        "FL",     // slot 0 (Left top)
+        "RL",     // slot 1 (Left bottom)
+        "FR",     // slot 2 (Right top)
+        "RR",     // slot 3 (Right bottom)
     };
     for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
         memset(&g_tireState[i], 0, sizeof(TireState));
@@ -197,27 +201,19 @@ void lcdBegin() {
     Serial.println("[LCD] dual init OK (L+R)");
 }
 
-void lcdUpdateTire(int sensorDefIdx, float kPa, float bar, int tempC, const char* alertStr) {
-    if (sensorDefIdx < 0 || sensorDefIdx >= LCD_SENSOR_COUNT) return;
+void lcdUpdateTire(int lcdSlot, uint32_t sensorId, float psi, float bar, float kPa, float temperatureC) {
+    if (lcdSlot < 0 || lcdSlot >= LCD_SENSOR_COUNT) return;
 
-    TireState& ts   = g_tireState[sensorDefIdx];
-    ts.kPa          = kPa;
+    TireState& ts   = g_tireState[lcdSlot];
+    ts.sensorId     = sensorId;
+    ts.psi          = psi;
     ts.bar          = bar;
-    ts.tempC        = tempC;
+    ts.kPa          = kPa;
+    ts.temperatureC = temperatureC;
     ts.lastUpdateMs = millis();
     ts.valid        = true;
 
-    if (alertStr == nullptr || alertStr[0] == '\0') {
-        ts.alertCode = 0;
-    } else if (strstr(alertStr, "減圧")) {
-        ts.alertCode = 1;
-    } else if (strstr(alertStr, "加圧")) {
-        ts.alertCode = 2;
-    } else {
-        ts.alertCode = 3;
-    }
-
-    g_dirty[sensorDefIdx] = true;
+    g_dirty[lcdSlot] = true;
 }
 
 void lcdRefresh() {
@@ -227,10 +223,10 @@ void lcdRefresh() {
     }
     if (!anyDirty) return;
 
-    for (int sdi = 0; sdi < LCD_SENSOR_COUNT; sdi++) {
-        if (!g_dirty[sdi]) continue;
-        drawSlot(LCD_SDEF_TO_SLOT[sdi]);
-        g_dirty[sdi] = false;
+    for (int slot = 0; slot < LCD_SENSOR_COUNT; slot++) {
+        if (!g_dirty[slot]) continue;
+        drawSlot(slot);
+        g_dirty[slot] = false;
     }
     drawDividers();
 }
