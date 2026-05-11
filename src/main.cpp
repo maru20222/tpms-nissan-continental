@@ -319,6 +319,10 @@ struct ContinentalTPMSData {
   uint8_t  extraByte;       // byte after CRC (flags/sequence if available)
   bool     hasExtra;
   bool     valid;
+  // Status fields (derived from brand byte and extra byte)
+  bool     pressureAlert;   // brand bit5: 0=alert, 1=normal
+  bool     batteryLow;      // extra bit7: 1=low battery (tentative)
+  uint8_t  sequence;        // extra bit5-0: 6-bit sequence counter
 };
 
 // Decode Continental TPMS from Manchester decoded bits, starting at bitOffset
@@ -358,7 +362,12 @@ ContinentalTPMSData decodeContinentalTPMS(const uint8_t* bits, int nBits, int bi
   if (maxBytes >= 9) {
     d.extraByte = pkt[8];
     d.hasExtra = true;
+    d.batteryLow = (pkt[8] & 0x80) != 0;   // bit7: battery flag
+    d.sequence   = pkt[8] & 0x3F;          // bit5-0: sequence counter
   }
+
+  // Brand byte status: bit5 = 0 → pressure alert
+  d.pressureAlert = (d.brand & 0x20) == 0;
 
   // Validity: CRC must match, pressure in reasonable range
   if (d.crcValid &&
@@ -792,7 +801,9 @@ void loop() {
                 preambleScore,
                 sensorRecords[recIdx].count);
   if (bestData.bitOffset != 0) Serial.printf(" bitOff=%d", bestData.bitOffset);
-  if (bestData.hasExtra) Serial.printf(" extra=%02X", bestData.extraByte);
+  if (bestData.hasExtra) Serial.printf(" extra=%02X seq=%d", bestData.extraByte, bestData.sequence);
+  if (bestData.pressureAlert) Serial.printf(" ALERT");
+  if (bestData.batteryLow) Serial.printf(" BATLOW");
   Serial.printf(" (h=%d pf=%.2f ir=%.2f)\n",
                 halfUs, peakFrac, bestInvRate);
 
