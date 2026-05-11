@@ -6,6 +6,8 @@ ESP32-S3 + CC1101 を使ったタイヤ空気圧モニタ（TPMS）センサー�
 - CRC-8（poly=0x07, init=0xAA）による検証済みデコード
 - 4輪の空気圧（bar/kPa）・温度をデュアルLCDに表示
 
+![LCD wiring](doc/image/20260511_lcd_wiring_st7789.jpg)
+
 ## 対象センサー
 
 | 項目 | 内容 |
