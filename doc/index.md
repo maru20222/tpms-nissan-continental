@@ -1,5 +1,11 @@
 ﻿# TPMS受信機 ハードウェア構成（Nissan / Continental）
 
+## 回路図（Schemdraw）
+
+![TPMS回路図](image/tpms_circuit_schemdraw.svg)
+
+※ 回路図の生成スクリプト: `doc/image/generate_tpms_circuit.py`
+
 ## CC1101とESP32-S3-WROOM-2 N32R16V ピン対応表
 
 ### SPI接続
@@ -178,7 +184,7 @@ CC1101 とは**独立した SPI3 バス**を使用（速度設定の切り替え
 | RES | ハードリセット | GPIO4 | 第1LCD（左側、既存）|
 | DC | データ/コマンド | GPIO5 | 第1LCD（左側、既存）|
 | CS | チップセレクト | GPIO6 | 第1LCD（左側、既存）|
-| BLK | バックライト | GPIO7 | 全LCD共用（High=ON、または3.3V直結）|
+| BLK | バックライト | GPIO7 | 全LCD共用、Pch MOSFET(ZVP2106A) 高側スイッチで **LOW=ON**（PWM 調光可、起動時 OFF）|
 
 右側用に追加する第2台LCDの制御ピン：
 

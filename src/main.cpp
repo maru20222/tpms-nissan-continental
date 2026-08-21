@@ -4,7 +4,10 @@
 //
 // Sensor: Continental S180052353E  (FCC: KR5S180052015B)
 //   Nissan part: 40700-4GA0B
-//   FL:AE5C32C8  FR:AC4ACC28  RL:AE58E836  RR:AC4CCF67
+//   Active IDs (Autel MX-Sensor, registered in KNOWN_SENSORS):
+//     FL:11111111  FR:22222222  RL:33333333  RR:44444444
+//   Dev IDs (original OEM sensors, for reference):
+//     FL:AE5C32C8  FR:AC4ACC28  RL:AE58E836  RR:AC4CCF67
 //
 // Protocol (reverse-engineered from captures + BMW Gen5 reference):
 //   Modulation  : FSK, Manchester coded (G.E. Thomas)
@@ -40,10 +43,10 @@ struct KnownSensor {
 };
 
 static const KnownSensor KNOWN_SENSORS[] = {
-  { 0xAE5C32C8, 0, "FL:40700-4GA0B" },  // FL
-  { 0xAC4ACC28, 2, "FR:40700-4GA0B" },  // FR
-  { 0xAE58E836, 1, "RL:40700-4GA0B" },  // RL
-  { 0xAC4CCF67, 3, "RR:40700-4GA0B" },  // RR
+  { 0x11111111, 0, "FL:40700-4GA0B" },  // FL
+  { 0x22222222, 2, "FR:40700-4GA0B" },  // FR
+  { 0x33333333, 1, "RL:40700-4GA0B" },  // RL
+  { 0x44444444, 3, "RR:40700-4GA0B" },  // RR
 };
 static const int KNOWN_SENSOR_COUNT = (int)(sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]));
 

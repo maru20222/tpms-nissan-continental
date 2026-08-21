@@ -8,7 +8,7 @@
 // SPI バス共有
 #define LCD_SCK   17
 #define LCD_MOSI  18
-#define LCD_BL     7    // バックライト（全LCD共用）
+#define LCD_BL     7    // バックライト（全LCD共用、Pch MOSFET 高側スイッチ: LOW=ON）
 
 // 第1LCD（左側、既存）
 #define LCD1_RST   4
@@ -165,8 +165,9 @@ static void drawDividers() {
 
 void lcdBegin() {
     // バックライト ON（全LCD共用）
+    // Pチャネル MOSFET (ZVP2106A) による高側スイッチのため LOW=点灯。
     pinMode(LCD_BL, OUTPUT);
-    digitalWrite(LCD_BL, HIGH);
+    digitalWrite(LCD_BL, LOW);
 
     // FSPI(SPI2) を LCD ピンで初期化。CC1101 の HSPI(SPI3) と別ホストなので衝突なし。
     lcdSpi.begin(LCD_SCK, /*MISO*/ -1, LCD_MOSI, LCD1_CS);
