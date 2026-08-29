@@ -353,6 +353,38 @@ def build_tpms_diagram(output_dir: Path) -> None:
             )
 
         # ------------------------------------------------------------------
+        # デカップリング: CC1101 pin2(VCC) - pin1(GND) 間に 0.1µF
+        #   電源直近のバイパスコンデンサ。信号線(pin3〜8)と交差しない
+        #   よう本体左側(x=-14.5)へ縦置きし、VCC は本体上・GND は本体下
+        #   を回して接続する。両ピン先端(タップ点)に Dot を打つ。
+        # ------------------------------------------------------------------
+        cc_cap_x = -14.5
+        cc_cap_top, cc_cap_bot = 7.6, 5.6
+        # VCC(pin2): 本体上(y=9.8)を回って左の縦置きコンデンサ上端へ
+        cc_vcc_pts = [
+            (cc.CC_VCC.x, cc.CC_VCC.y),
+            (cc.CC_VCC.x, 9.8),
+            (cc_cap_x, 9.8),
+            (cc_cap_x, cc_cap_top),
+        ]
+        for a, b in zip(cc_vcc_pts[:-1], cc_vcc_pts[1:]):
+            d.add(elm.Line().at(a).to(b).color('red'))
+        # GND(pin1): 本体下(y=3.0)を回って左の縦置きコンデンサ下端へ
+        cc_gnd_pts = [
+            (cc.CC_GND.x, cc.CC_GND.y),
+            (cc.CC_GND.x, 3.0),
+            (cc_cap_x, 3.0),
+            (cc_cap_x, cc_cap_bot),
+        ]
+        for a, b in zip(cc_gnd_pts[:-1], cc_gnd_pts[1:]):
+            d.add(elm.Line().at(a).to(b).color('black'))
+        cccap = elm.Capacitor().at((cc_cap_x, cc_cap_top)).to((cc_cap_x, cc_cap_bot))
+        cccap.label('0.1µF', loc='bottom', ofst=0.3)
+        d.add(cccap)
+        d.add(elm.Dot(radius=0.12).at((cc.CC_VCC.x, cc.CC_VCC.y)).color('red').fill('red'))
+        d.add(elm.Dot(radius=0.12).at((cc.CC_GND.x, cc.CC_GND.y)).color('black').fill('black'))
+
+        # ------------------------------------------------------------------
         # 結線: ESP32 <-> LCD1
         #   LCD は物理ピン順(VCC,GND,SCL,SDA,RES,DC,CS,BLK)固定。
         #   ・GND : ESP32 右上 GND を利用し、LCD 右側から上へ回して接続。

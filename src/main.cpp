@@ -4,9 +4,10 @@
 //
 // Sensor: Continental S180052353E  (FCC: KR5S180052015B)
 //   Nissan part: 40700-4GA0B
-//   Active IDs (Autel MX-Sensor, registered in KNOWN_SENSORS):
+//   Build env switch: TPMS_ENV_DEV (see below)
+//   PROD IDs (Autel MX-Sensor):
 //     FL:11111111  FR:22222222  RL:33333333  RR:44444444
-//   Dev IDs (original OEM sensors, for reference):
+//   DEV IDs (original OEM sensors):
 //     FL:AE5C32C8  FR:AC4ACC28  RL:AE58E836  RR:AC4CCF67
 //
 // Protocol (reverse-engineered from captures + BMW Gen5 reference):
@@ -27,6 +28,20 @@
 #include <RadioLib.h>
 #include "lcd_display.h"
 
+// ====== Build environment: dev / prod ======
+// TPMS_ENV_DEV = 1 : dev  (original OEM sensors: AE5C32C8 ...)
+// TPMS_ENV_DEV = 0 : prod (Autel MX-Sensors:     11111111 ...)
+// Override from platformio.ini with e.g. build_flags = -DTPMS_ENV_DEV=0
+#ifndef TPMS_ENV_DEV
+#define TPMS_ENV_DEV 0
+#endif
+
+#if TPMS_ENV_DEV
+static const char* const TPMS_ENV_NAME = "DEV (OEM sensors)";
+#else
+static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
+#endif
+
 // ====== Pin wiring ======
 static const int PIN_CS   = 10;
 static const int PIN_SCK  = 12;
@@ -42,12 +57,23 @@ struct KnownSensor {
   const char* partNo;
 };
 
+#if TPMS_ENV_DEV
+// dev: original OEM sensors
+static const KnownSensor KNOWN_SENSORS[] = {
+  { 0xAE5C32C8, 0, "FL:40700-4GA0B" },  // FL
+  { 0xAC4ACC28, 2, "FR:40700-4GA0B" },  // FR
+  { 0xAE58E836, 1, "RL:40700-4GA0B" },  // RL
+  { 0xAC4CCF67, 3, "RR:40700-4GA0B" },  // RR
+};
+#else
+// prod: Autel MX-Sensors
 static const KnownSensor KNOWN_SENSORS[] = {
   { 0x11111111, 0, "FL:40700-4GA0B" },  // FL
   { 0x22222222, 2, "FR:40700-4GA0B" },  // FR
   { 0x33333333, 1, "RL:40700-4GA0B" },  // RL
   { 0x44444444, 3, "RR:40700-4GA0B" },  // RR
 };
+#endif
 static const int KNOWN_SENSOR_COUNT = (int)(sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]));
 
 static int findKnownSensorSlot(uint32_t sensorId) {
@@ -550,6 +576,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_GDO2), isrGdo2, CHANGE);
 
   Serial.println("=== Continental/Nissan TPMS Receiver @ 315.0 MHz (v3) ===");
+  Serial.printf("Build env: %s\n", TPMS_ENV_NAME);
   Serial.println("Sensor: S180052353E / 40700-4GA0B / ID:AE5C32C8");
   Serial.println("Format: Brand(8)+ID(32)+Press(8)+Temp(8)+CRC8(8) = 64bit");
 

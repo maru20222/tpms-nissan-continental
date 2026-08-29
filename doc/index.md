@@ -19,7 +19,7 @@
 | 5 | SCK | GPIO12 | SPI クロック |
 | 6 | MOSI (SI) | GPIO11 | SPI データ入力 (Master Out Slave In) |
 | 7 | MISO (SO) | GPIO13 | SPI データ出力 (Master In Slave Out) |
-| 8 | GDO2 | GPIO15 | 非同期データ出力（割り込み用） |
+| 8 | GDO2 | GPIO15 | 非同期データ出力（割り込み用）、GND線を平行に配置しAsync Data線のループ面積縮小＋擬似シールド |
 
 ### 備考
 
