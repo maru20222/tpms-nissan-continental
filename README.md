@@ -47,7 +47,7 @@ Brand(8) + SensorID(32) + Pressure(8) + Temperature(8) + CRC-8(8)
 | マイコン | ESP32-S3-WROOM-2 N32R16V (DevKitC-1) |
 | 受信IC | CC1101（315MHz帯） |
 | LCD | 秋月電子 M154-240240-RGB（ST7789, 240×240）× 2台 |
-| アンテナ | UHX-328ASA2B |
+| アンテナ | 1/2λ(半波長)ダイポールアンテナ |
 | フレームワーク | PlatformIO / Arduino |
 
 ## ドキュメント
