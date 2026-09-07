@@ -48,3 +48,9 @@ void lcdUpdateTire(int lcdSlot, uint32_t sensorId, float psi, float bar, float k
 
 // 変更のあった象限を再描画（loop() 内で周期的に呼ぶ）
 void lcdRefresh();
+
+// 致命エラー画面を左右LCD全面に表示（再起動前の告知用）
+void lcdShowFatal(const char* title, const char* detail);
+
+// 致命エラー画面の再起動カウントダウン部分だけ更新
+void lcdShowFatalCountdown(int secLeft);

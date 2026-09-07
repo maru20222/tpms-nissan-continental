@@ -11,8 +11,9 @@ if (-not (Test-Path $dir -PathType Container)) {
 }
 
 # タイムスタンプ付きファイル名
+# StreamWriter は .NET のカレントディレクトリ基準になるため絶対パスにする
 $ts = Get-Date -Format 'yyyyMMddHHmmss'
-$file = Join-Path $dir ("serial_$ts.log")
+$file = Join-Path (Resolve-Path $dir).Path ("serial_$ts.log")
 
 # pio を探す（PATH -> 既知の場所 -> python -m platformio）
 $pioCmd = $null
@@ -49,8 +50,24 @@ if ($rc -ne 0) {
 }
 
 # monitor を実行してログへ追記（画面表示＋ファイル保存）
-if ($usePython) {
-    python -m platformio device monitor | Tee-Object -FilePath $file -Append
-} else {
-    & $pioCmd device monitor | Tee-Object -FilePath $file -Append
+# Tee-Object は PS5.1 では UTF-16 固定でエンコーディング指定不可のため StreamWriter を使う。
+$enc = New-Object System.Text.UTF8Encoding($false)   # $true にすると BOM 付き
+$sw  = New-Object System.IO.StreamWriter($file, $true, $enc)
+try {
+    if ($usePython) {
+        python -m platformio device monitor 2>&1 | ForEach-Object {
+            Write-Host $_
+            $sw.WriteLine($_)
+            $sw.Flush()   # Ctrl+C で中断してもログを残すため毎行フラッシュ
+        }
+    } else {
+        & $pioCmd device monitor 2>&1 | ForEach-Object {
+            Write-Host $_
+            $sw.WriteLine($_)
+            $sw.Flush()
+        }
+    }
+}
+finally {
+    $sw.Close()
 }

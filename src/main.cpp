@@ -113,6 +113,22 @@ uint8_t ccRead(uint8_t addr) {
   return v;
 }
 
+// Status registers (e.g. RSSI 0x34) require READ+BURST (0xC0) header.
+uint8_t ccReadStatus(uint8_t addr) {
+  digitalWrite(PIN_CS, LOW);
+  cc1101Spi.transfer(addr | 0xC0);
+  uint8_t v = cc1101Spi.transfer(0);
+  digitalWrite(PIN_CS, HIGH);
+  return v;
+}
+
+// CC1101 RSSI in dBm (offset ~74 dB for these settings).
+int ccRssiDbm() {
+  uint8_t raw = ccReadStatus(0x34);
+  int r = (raw >= 128) ? (raw - 256) : raw;
+  return (r / 2) - 74;
+}
+
 void ccSetPktFormat(uint8_t fmt) {
   uint8_t v = ccRead(0x08);  // PKTCTRL0
   v = (uint8_t)((v & ~0x30) | ((fmt & 0x03) << 4));
@@ -124,7 +140,8 @@ void ccEnableAsyncOnGDO2() {
   ccWrite(0x00, 0x0D);        // IOCFG2 = async data out
   ccWrite(0x02, 0x0E);        // IOCFG0 = Carrier Sense
 
-  // AGC: maximum sensitivity for 315MHz
+  // AGC: maximum sensitivity for 315MHz (bench-proven config; the in-vehicle
+  // issue is SNR/noise-floor, not gain, so keep the known-good sensitivity)
   ccWrite(0x07, 0x01);  // AGCCTRL2: MAX_LNA_GAIN=000, MAGN_TARGET=001
   ccWrite(0x06, 0x40);  // AGCCTRL1: AGC_LNA_PRIORITY=1
   ccWrite(0x05, 0x0F);  // AGCCTRL0: HYST=00, WAIT=11, FILTER=11
@@ -398,9 +415,13 @@ ContinentalTPMSData decodeContinentalTPMS(const uint8_t* bits, int nBits, int bi
   // Brand byte status: bit5 = 0 → pressure alert
   d.pressureAlert = (d.brand & 0x20) == 0;
 
-  // Validity: CRC must match, pressure in reasonable range
+  // Validity: CRC alone gives a 1/256 false-hit rate across the brute-force
+  // offset scan, so also require a real Continental brand byte (0xA8 normal /
+  // 0x98 pressure-alert) and physically plausible pressure/temperature.
   if (d.crcValid &&
+      (d.brand == 0xA8 || d.brand == 0x98) &&
       d.pressurePsi >= 0.0f && d.pressurePsi <= 80.0f &&
+      d.temperatureC >= -40.0f && d.temperatureC <= 100.0f &&
       d.sensorId != 0 && d.sensorId != 0xFFFFFFFF)
     d.valid = true;
 
@@ -563,6 +584,63 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
   return diagResult;
 }
 
+// Diagnostic decode for packet-sized bursts that failed the halfUs filter.
+// Tries fixed half-bit candidates (independent of the broken estimate) and dumps
+// Manchester bytes + CRC scan, to identify the true bit period and confirm the
+// packet is decodable vs. front-end noise.
+void diagBigBurst(const uint16_t* dts, const uint8_t* lvs, int n, uint32_t durMs) {
+  static const int cand[] = { 30, 61, 122 };
+  static uint8_t bigHalf[8000];
+  // Cross-burst repeat table: a real sensor repeats the same ID; random CRC
+  // collisions do not. Only IDs seen in >=2 separate bursts are trustworthy.
+  static uint32_t seenId[32];
+  static uint8_t  seenCnt[32];
+  static int      seenN = 0;
+
+  for (int ci = 0; ci < (int)(sizeof(cand) / sizeof(cand[0])); ci++) {
+    int hu = cand[ci];
+    int halfN = expandToHalfbits(dts, lvs, n, hu, bigHalf, (int)sizeof(bigHalf));
+    Serial.printf("    [BigDiag] half=%dus halfN=%d\n", hu, halfN);
+    if (halfN < 80) continue;
+    for (int inv = 0; inv <= 1; inv++) {
+      static uint8_t bits[400];
+      int nb = manchesterDecode(bigHalf, halfN, bits, (int)sizeof(bits), inv != 0);
+      if (nb < 65) continue;
+      int nbytes = min(12, nb / 8);
+      Serial.printf("      manch inv=%d (%dbit): ", inv, nb);
+      for (int b = 0; b < nbytes; b++) {
+        uint8_t v = 0;
+        for (int bit = 0; bit < 8; bit++)
+          v = (uint8_t)((v << 1) | (bits[b * 8 + bit] & 1));
+        Serial.printf("%02X ", v);
+      }
+      Serial.println();
+      // Scan start offset (0-3 half-bits) x bit alignment (0-7) for a valid CRC
+      for (int start = 0; start <= 3; start++) {
+        int sn = manchesterDecode(bigHalf + start, halfN - start, bits, (int)sizeof(bits), inv != 0);
+        for (int bo = 0; bo <= 7 && bo + 64 <= sn; bo++) {
+          ContinentalTPMSData t = decodeContinentalTPMS(bits, sn, bo);
+          // Only trust hits that look like a real Continental packet:
+          // brand==0xA8 and a plausible pressure. Kills random CRC collisions.
+          if (t.crcValid && t.brand == 0xA8 &&
+              t.pressurePsi >= 5.0f && t.pressurePsi <= 60.0f) {
+            int slot = -1;
+            for (int s = 0; s < seenN; s++)
+              if (seenId[s] == t.sensorId) { slot = s; break; }
+            if (slot < 0 && seenN < 32) { slot = seenN++; seenId[slot] = t.sensorId; seenCnt[slot] = 0; }
+            if (slot >= 0 && seenCnt[slot] < 255) seenCnt[slot]++;
+            Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=A8 ID=%08X PSI=%.1f %dC seen=%d%s\n",
+                          hu, inv, start, bo, t.sensorId,
+                          t.pressurePsi, (int)t.temperatureC,
+                          (slot >= 0) ? seenCnt[slot] : 0,
+                          (slot >= 0 && seenCnt[slot] >= 2) ? "  ** REPEAT (real!) **" : "");
+          }
+        }
+      }
+    }
+  }
+}
+
 // ====== setup() ======
 void setup() {
   Serial.begin(115200);
@@ -580,11 +658,31 @@ void setup() {
   Serial.println("Sensor: S180052353E / 40700-4GA0B / ID:AE5C32C8");
   Serial.println("Format: Brand(8)+ID(32)+Press(8)+Temp(8)+CRC8(8) = 64bit");
 
-  // CC1101 init: 315.0 MHz, 8.192 kbps (=1/122us), FSK dev 40 kHz, RxBW 325kHz
-  int st = radio.begin(315.0, 8.192, 40.0, 325.0);
+  // CC1101 init: 315.0 MHz, 8.192 kbps (=1/122us), FSK dev 40 kHz
+  // RxBW narrowed 325->135kHz to cut noise bandwidth (~+4dB sensitivity) for the
+  // marginal in-vehicle link. Wide enough for +-40kHz deviation + crystal error.
+  int st = radio.begin(315.0, 8.192, 40.0, 135.0);
   Serial.printf("radio.begin = %d\n", st);
-  if (st != RADIOLIB_ERR_NONE)
-    Serial.printf("!! CC1101 init FAILED (code=%d)\n", st);
+  if (st != RADIOLIB_ERR_NONE) {
+    // 車載時のみ発生（電源投入直後の電圧変動でCC1101がまだ応答しない）。
+    // 電源が安定するのを待って1回だけリトライする。
+    Serial.printf("!! CC1101 init FAILED (code=%d) -> retry in 500ms\n", st);
+    delay(500);
+    st = radio.begin(315.0, 8.192, 40.0, 135.0);
+    Serial.printf("radio.begin (retry) = %d\n", st);
+  }
+  if (st != RADIOLIB_ERR_NONE) {
+    // 無線が死んだまま走り続けても意味がないので、LCDに10秒表示してから再起動。
+    Serial.printf("!! CC1101 init FAILED (code=%d) -> reboot in 10s\n", st);
+    lcdBegin();
+    char detail[32];
+    snprintf(detail, sizeof(detail), "CC1101 code=%d", st);
+    lcdShowFatal("RF FAIL", detail);
+    for (int s = 10; s > 0; s--) { lcdShowFatalCountdown(s); delay(1000); }
+    Serial.println("Rebooting...");
+    Serial.flush();
+    ESP.restart();
+  }
 
   radio.setCrcFiltering(false);
   radio.setPromiscuousMode(true, true);
@@ -608,6 +706,19 @@ void loop() {
   static uint32_t lastKickMs = 0;
   static uint32_t cntBurst = 0, cntInRange = 0;
   static uint32_t cntPreamble = 0, cntDecoded = 0;
+  // Packet-sized bursts (edges >= BIG_BURST_EDGES): a real Continental packet
+  // needs ~150-260 edges. Tracks whether such bursts arrive but get filtered out.
+  static const int BIG_BURST_EDGES = 120;
+  static uint32_t cntBig = 0, cntBigDropped = 0;
+  static int      maxEdgesSeen = 0;
+  // Ambient RSSI (noise floor): distinguishes a noisy vehicle RF environment
+  // from a weak-signal/antenna problem. Sampled when idle (no active burst).
+  static int      rssiMin = 127, rssiMax = -127, rssiCnt = 0;
+  static long     rssiSum = 0;
+  static uint32_t lastRssiMs = 0;
+  // Peak RSSI sampled DURING a burst -> how far the burst rises above the floor.
+  static int      curBurstRssiMax = -127;   // resets per burst
+  static int      bigRssiMax = -127;         // peak among big bursts (STATS)
 
   uint32_t nowUs = micros();
 
@@ -628,6 +739,19 @@ void loop() {
     if (millis() - lastLcdMs >= 200) { lastLcdMs = millis(); lcdRefresh(); }
   }
 
+  // RSSI sampling: noise floor when idle, peak signal while a burst is captured
+  if ((millis() - lastRssiMs) >= 2) {
+    lastRssiMs = millis();
+    int r = ccRssiDbm();
+    if (edgeN == 0) {
+      if (r < rssiMin) rssiMin = r;
+      if (r > rssiMax) rssiMax = r;
+      rssiSum += r; rssiCnt++;
+    } else if (!burstReady) {
+      if (r > curBurstRssiMax) curBurstRssiMax = r;
+    }
+  }
+
   // Stats (60s)
   {
     static uint32_t lastStatMs = 0;
@@ -637,6 +761,13 @@ void loop() {
                     (unsigned long)cntBurst, (unsigned long)cntInRange,
                     (unsigned long)cntPreamble, (unsigned long)cntDecoded,
                     sensorRecordCount);
+      Serial.printf("    big(>=%d edges)=%lu dropped=%lu maxEdges=%d\n",
+                    BIG_BURST_EDGES, (unsigned long)cntBig,
+                    (unsigned long)cntBigDropped, maxEdgesSeen);
+      Serial.printf("    noiseFloor RSSI min=%d avg=%d max=%d dBm (n=%d)\n",
+                    (rssiCnt ? rssiMin : 0), (rssiCnt ? (int)(rssiSum / rssiCnt) : 0),
+                    (rssiCnt ? rssiMax : 0), rssiCnt);
+      Serial.printf("    bigBurst peak RSSI max=%d dBm\n", bigRssiMax);
       for (int i = 0; i < sensorRecordCount; i++) {
         uint32_t age = (millis() - sensorRecords[i].lastSeenMs) / 1000;
         Serial.printf("  ID=%08X count=%d PSI=%.1f %.0fC slot=%d (%lus ago)\n",
@@ -645,6 +776,9 @@ void loop() {
                       sensorRecords[i].lcdSlot, (unsigned long)age);
       }
       cntBurst = 0; cntInRange = 0; cntPreamble = 0; cntDecoded = 0;
+      cntBig = 0; cntBigDropped = 0; maxEdgesSeen = 0;
+      rssiMin = 127; rssiMax = -127; rssiSum = 0; rssiCnt = 0;
+      bigRssiMax = -127;
     }
   }
 
@@ -668,9 +802,16 @@ void loop() {
 
   uint32_t dur = bEnd - bStart;
   cntBurst++;
+  if (n > maxEdgesSeen) maxEdgesSeen = n;
+  bool bigBurst = (n >= BIG_BURST_EDGES);
+  if (bigBurst) cntBig++;
+  int burstRssi = curBurstRssiMax;   // peak RSSI captured during this burst
+  curBurstRssiMax = -127;
+  if (bigBurst && burstRssi > bigRssiMax) bigRssiMax = burstRssi;
 
   // ---- Basic filters ----
   if (dur < 3000 || dur > 300000 || n < MIN_EDGES) {
+    if (bigBurst) cntBigDropped++;
     radio.startReceive();
     return;
   }
@@ -684,16 +825,70 @@ void loop() {
   // Eliminates false triggers from noise at h=46, 52, 64 etc.
   // ============================================================
   if (halfUs < 100 || halfUs > 150) {
+    // A packet-sized burst rejected here may be a real packet with a skewed
+    // halfUs estimate -> dump raw timing (throttled) to read its true bit period.
+    if (bigBurst) {
+      cntBigDropped++;
+      static uint32_t lastBigMs = 0;
+      if (millis() - lastBigMs >= 2000) {
+        lastBigMs = millis();
+        Serial.printf("  [BigDrop halfUs] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
+                      n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);
+        // dt-histogram: top 6 peaks (5us bins) to reveal the real half-bit period
+        static uint16_t dtBins[61];
+        memset(dtBins, 0, sizeof(dtBins));
+        for (int i = 0; i < n; i++) {
+          int bin = dts[i] / 5;
+          if (bin >= 0 && bin < 61) dtBins[bin]++;
+        }
+        Serial.printf("    dt-hist: ");
+        for (int top = 0; top < 6; top++) {
+          int bestBin = -1; uint16_t bestCntB = 0;
+          for (int b = 0; b < 61; b++)
+            if (dtBins[b] > bestCntB) { bestCntB = dtBins[b]; bestBin = b; }
+          if (bestBin < 0 || bestCntB == 0) break;
+          Serial.printf("%d-%dus(%d) ", bestBin * 5, bestBin * 5 + 4, bestCntB);
+          dtBins[bestBin] = 0;
+        }
+        Serial.println();
+        int showN = min(n, 48);
+        Serial.printf("    edges[0..%d]: ", showN - 1);
+        for (int i = 0; i < showN; i++)
+          Serial.printf("%u%c ", dts[i], lvs[i] ? 'H' : 'L');
+        Serial.println();
+        // Attempt decode at fixed half-bit candidates (61/122us) to find the packet
+        diagBigBurst(dts, lvs, n, dur / 1000);
+      }
+    }
     radio.startReceive();
     return;
   }
 
   if (peakFrac < 0.15f) {
+    if (bigBurst) {
+      cntBigDropped++;
+      static uint32_t lastBigMs = 0;
+      if (millis() - lastBigMs >= 1000) {
+        lastBigMs = millis();
+        Serial.printf("  [BigDrop pf] n=%d dur=%lums halfUs=%d pf=%.2f\n",
+                      n, (unsigned long)(dur / 1000), halfUs, peakFrac);
+      }
+    }
     radio.startReceive();
     return;
   }
 
   cntInRange++;
+
+  // Per-burst signal strength for the candidate TPMS fragments (throttled).
+  {
+    static uint32_t lastIrMs = 0;
+    if (millis() - lastIrMs >= 1000) {
+      lastIrMs = millis();
+      Serial.printf("  [InRange] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
+                    n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);
+    }
+  }
 
   // ---- Expand to half-bits ----
   static uint8_t halfLv[8000];

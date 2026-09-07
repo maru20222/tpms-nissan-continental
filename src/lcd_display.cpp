@@ -67,6 +67,36 @@ static uint16_t pressureColor(float kPa, bool valid) {
     return COLOR_GREEN;
 }
 
+// 最終受信からの経過秒 (1〜999s にクランプ)
+static uint16_t slotAgeSec(const TireState& ts) {
+    uint32_t sec = (millis() - ts.lastUpdateMs) / 1000;
+    if (sec < 1)   sec = 1;
+    if (sec > 999) sec = 999;
+    return (uint16_t)sec;
+}
+
+// 経過秒だけを再描画（kPa と温度の間の領域）
+static const int AGE_X = 100;
+static const int AGE_W = 56;
+
+static void drawSlotAge(int slot) {
+    if (slot < 0 || slot >= 4) return;
+    const TireState& ts = g_tireState[slot];
+    if (!ts.valid) return;
+
+    Adafruit_ST7789* tft = slotTft(slot);
+    const int sy = SLOT_Y[slot];
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%3us", slotAgeSec(ts));
+
+    tft->fillRect(AGE_X, sy + 84, AGE_W, 16, COLOR_BLACK);
+    tft->setTextColor(COLOR_LIGHTGREY);
+    tft->setTextSize(2);
+    tft->setCursor(AGE_X, sy + 84);
+    tft->print(buf);
+}
+
 // ─── 1 スロット描画 (240×120) ────────────────────────────────
 static void drawSlot(int slot) {
     if (slot < 0 || slot >= 4) return;
@@ -135,6 +165,13 @@ static void drawSlot(int slot) {
     tft->setCursor(8, sy + 84);
     tft->print(bufKpa);
 
+    // 最終受信からの経過秒
+    char bufAge[8];
+    snprintf(bufAge, sizeof(bufAge), "%3us", slotAgeSec(ts));
+    tft->setTextColor(COLOR_LIGHTGREY);
+    tft->setCursor(AGE_X, sy + 84);
+    tft->print(bufAge);
+
     // 温度表示
     char bufTemp[12];
     snprintf(bufTemp, sizeof(bufTemp), "%3.0fC", ts.temperatureC);
@@ -202,6 +239,41 @@ void lcdBegin() {
     Serial.println("[LCD] dual init OK (L+R)");
 }
 
+// ─── 致命エラー画面 ───────────────────────────────────────────
+static const int FATAL_CD_Y = 150;
+
+void lcdShowFatal(const char* title, const char* detail) {
+    Adafruit_ST7789* tfts[2] = { &tftL, &tftR };
+    for (int i = 0; i < 2; i++) {
+        Adafruit_ST7789* tft = tfts[i];
+        tft->fillScreen(COLOR_BLACK);
+        tft->setTextColor(COLOR_RED);
+        tft->setTextSize(4);
+        tft->setCursor(8, 50);
+        tft->print(title);
+        tft->setTextColor(COLOR_WHITE);
+        tft->setTextSize(2);
+        tft->setCursor(8, 110);
+        tft->print(detail);
+    }
+}
+
+void lcdShowFatalCountdown(int secLeft) {
+    if (secLeft < 0) secLeft = 0;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "REBOOT in %2ds", secLeft);
+
+    Adafruit_ST7789* tfts[2] = { &tftL, &tftR };
+    for (int i = 0; i < 2; i++) {
+        Adafruit_ST7789* tft = tfts[i];
+        tft->fillRect(8, FATAL_CD_Y, 232, 20, COLOR_BLACK);
+        tft->setTextColor(COLOR_YELLOW);
+        tft->setTextSize(2);
+        tft->setCursor(8, FATAL_CD_Y);
+        tft->print(buf);
+    }
+}
+
 void lcdUpdateTire(int lcdSlot, uint32_t sensorId, float psi, float bar, float kPa, float temperatureC) {
     if (lcdSlot < 0 || lcdSlot >= LCD_SENSOR_COUNT) return;
 
@@ -222,12 +294,18 @@ void lcdRefresh() {
     for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
         if (g_dirty[i]) { anyDirty = true; break; }
     }
-    if (!anyDirty) return;
 
     for (int slot = 0; slot < LCD_SENSOR_COUNT; slot++) {
         if (!g_dirty[slot]) continue;
         drawSlot(slot);
         g_dirty[slot] = false;
     }
-    drawDividers();
+    if (anyDirty) drawDividers();
+
+    // 経過秒は毎秒その領域だけ更新（全面再描画によるちらつきを避ける）
+    static uint32_t lastAgeMs = 0;
+    if (millis() - lastAgeMs >= 1000) {
+        lastAgeMs = millis();
+        for (int slot = 0; slot < LCD_SENSOR_COUNT; slot++) drawSlotAge(slot);
+    }
 }
