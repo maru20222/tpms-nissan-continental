@@ -262,7 +262,10 @@ void lcdShowFatalCountdown(int secLeft) {
     if (secLeft < 0) secLeft = 0;
     char buf[24];
     snprintf(buf, sizeof(buf), "REBOOT in %2ds", secLeft);
+    lcdShowFatalNote(buf);
+}
 
+void lcdShowFatalNote(const char* msg) {
     Adafruit_ST7789* tfts[2] = { &tftL, &tftR };
     for (int i = 0; i < 2; i++) {
         Adafruit_ST7789* tft = tfts[i];
@@ -270,8 +273,16 @@ void lcdShowFatalCountdown(int secLeft) {
         tft->setTextColor(COLOR_YELLOW);
         tft->setTextSize(2);
         tft->setCursor(8, FATAL_CD_Y);
-        tft->print(buf);
+        tft->print(msg);
     }
+}
+
+void lcdForceRedraw() {
+    tftL.fillScreen(COLOR_BLACK);
+    tftR.fillScreen(COLOR_BLACK);
+    for (int i = 0; i < LCD_SENSOR_COUNT; i++) g_dirty[i] = false;
+    for (int s = 0; s < LCD_SENSOR_COUNT; s++) drawSlot(s);
+    drawDividers();
 }
 
 void lcdUpdateTire(int lcdSlot, uint32_t sensorId, float psi, float bar, float kPa, float temperatureC) {

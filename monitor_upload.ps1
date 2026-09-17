@@ -50,20 +50,46 @@ if ($rc -ne 0) {
 }
 
 # monitor を実行してログへ追記（画面表示＋ファイル保存）
-# Tee-Object は PS5.1 では UTF-16 固定でエンコーディング指定不可のため StreamWriter を使う。
+# pyserial (miniterm) を直接使って対話型の問題（UserSideException）を回避します。
+Write-Host "Starting serial monitor (logging to $file)..." -ForegroundColor Green
+
 $enc = New-Object System.Text.UTF8Encoding($false)   # $true にすると BOM 付き
 $sw  = New-Object System.IO.StreamWriter($file, $true, $enc)
+
 try {
-    if ($usePython) {
-        python -m platformio device monitor 2>&1 | ForEach-Object {
-            Write-Host $_
-            $sw.WriteLine($_)
-            $sw.Flush()   # Ctrl+C で中断してもログを残すため毎行フラッシュ
+    # platformio.ini からボーレートとポートを取得する
+    $baud = 115200
+    $port = $null
+    if (Test-Path "platformio.ini") {
+        $iniContent = Get-Content "platformio.ini" -Raw
+        if ($iniContent -match 'monitor_speed\s*=\s*(\d+)') {
+            $baud = [int]$Matches[1]
+        }
+        if ($iniContent -match 'monitor_port\s*=\s*([^\r\n]+)') {
+            $port = $Matches[1].Trim()
+        }
+    }
+
+    # プラットフォーム固有の python (PlatformIOの仮想環境内) またはシステムの python を探す
+    $pyCmd = "python"
+    $candidatePy = Join-Path $env:USERPROFILE '.platformio\penv\Scripts\python.exe'
+    if (Test-Path $candidatePy) {
+        $pyCmd = $candidatePy
+    }
+
+        # pyserial miniterm を実行 (--exit-char 3 を追加して Ctrl+C で終了できるようにする)
+    if ($port) {
+        & $pyCmd -m serial.tools.miniterm --exit-char 3 --eol LF $port $baud 2>&1 | ForEach-Object {
+            $line = $_.ToString()
+            Write-Host $line
+            $sw.WriteLine($line)
+            $sw.Flush()
         }
     } else {
-        & $pioCmd device monitor 2>&1 | ForEach-Object {
-            Write-Host $_
-            $sw.WriteLine($_)
+        & $pyCmd -m serial.tools.miniterm --exit-char 3 --eol LF $baud 2>&1 | ForEach-Object {
+            $line = $_.ToString()
+            Write-Host $line
+            $sw.WriteLine($line)
             $sw.Flush()
         }
     }

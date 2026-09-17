@@ -54,3 +54,9 @@ void lcdShowFatal(const char* title, const char* detail);
 
 // 致命エラー画面の再起動カウントダウン部分だけ更新
 void lcdShowFatalCountdown(int secLeft);
+
+// 致命エラー画面の下段に任意メッセージを表示（リトライ回数など）
+void lcdShowFatalNote(const char* msg);
+
+// 通常画面を全面から描き直す（エラー画面からの復帰用）
+void lcdForceRedraw();

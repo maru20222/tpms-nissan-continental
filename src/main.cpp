@@ -25,6 +25,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <driver/gpio.h>
 #include <RadioLib.h>
 #include "lcd_display.h"
 
@@ -32,6 +33,10 @@
 // TPMS_ENV_DEV = 1 : dev  (original OEM sensors: AE5C32C8 ...)
 // TPMS_ENV_DEV = 0 : prod (Autel MX-Sensors:     11111111 ...)
 // Override from platformio.ini with e.g. build_flags = -DTPMS_ENV_DEV=0
+#ifndef ENABLE_DESK_TEST
+#define ENABLE_DESK_TEST false
+#endif
+
 #ifndef TPMS_ENV_DEV
 #define TPMS_ENV_DEV 0
 #endif
@@ -40,6 +45,10 @@
 static const char* const TPMS_ENV_NAME = "DEV (OEM sensors)";
 #else
 static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
+#endif
+
+#ifndef ENABLE_DETAILED_LOG
+#define ENABLE_DETAILED_LOG false
 #endif
 
 // ====== Pin wiring ======
@@ -92,8 +101,11 @@ static int findKnownSensorSlot(uint32_t sensorId) {
 }
 
 // ====== CC1101 SPI ======
+// 車載(ダッシュボード)は配線が長くノイズも多いので、RadioLib既定の2MHzでは
+// SPIが化けて ERR_CHIP_NOT_FOUND(-2) になる。500kHzまで落とす。
+static const SPISettings CC_SPI_SETTINGS(500000, MSBFIRST, SPI_MODE0);
 static SPIClass cc1101Spi(HSPI);
-CC1101 radio = new Module(PIN_CS, -1, -1, -1, cc1101Spi);
+CC1101 radio = new Module(PIN_CS, -1, -1, -1, cc1101Spi, CC_SPI_SETTINGS);
 
 // ====== CC1101 register helpers ======
 static const uint8_t READ_SINGLE = 0x80;
@@ -129,6 +141,82 @@ int ccRssiDbm() {
   return (r / 2) - 74;
 }
 
+// CC1101 データシート 19.1 の手動パワーオンリセット。
+// 車載時は5V/3V3の立ち上がりが遅く、自動PORが完了する前にSPIを叩いて
+// -2(CHIP_NOT_FOUND)になる。毎回これを先に入れて確実にリセットさせる。
+void ccPowerOnReset() {
+  cc1101Spi.beginTransaction(CC_SPI_SETTINGS);
+  digitalWrite(PIN_CS, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_CS, LOW);  delayMicroseconds(10);
+  digitalWrite(PIN_CS, HIGH); delayMicroseconds(45);
+  digitalWrite(PIN_CS, LOW);
+  uint32_t t0 = millis();
+  while (digitalRead(PIN_MISO) == HIGH && (millis() - t0) < 50) { }  // wait SO low
+  cc1101Spi.transfer(0x30);                                          // SRES strobe
+  t0 = millis();
+  while (digitalRead(PIN_MISO) == HIGH && (millis() - t0) < 50) { }  // wait reset done
+  digitalWrite(PIN_CS, HIGH);
+  cc1101Spi.endTransaction();
+  delay(5);
+}
+
+// CC1101 が全く応答しない(PARTNUM/VERSION=0x00)ときに、電源断線か SPI 配線かを切り分ける。
+// CC1101 の SO は CSn=L かつ XOSC 安定で L を出す。CSn=H では Hi-Z。
+void ccDiagPins() {
+  // --- SPI 経路テスト（バスを落とす前に実施） ---
+  // ヘッダ転送中に SO へ出るステータスバイトが取れるか = SCK が生きているか。
+  // SYNC1 への書き戻しが通るか = MOSI が生きているか。
+  // ここは再初期化直前にしか呼ばないので SYNC1 を壊して構わない。
+  digitalWrite(PIN_CS, LOW);
+  uint8_t stat = cc1101Spi.transfer(0x31 | 0xC0);
+  uint8_t ver  = cc1101Spi.transfer(0x00);
+  digitalWrite(PIN_CS, HIGH);
+  ccWrite(0x04, 0x5A);
+  uint8_t back = ccRead(0x04);
+  Serial.printf("[DIAG] SPI status=0x%02X ver=0x%02X  wr0x5A->rd0x%02X\n", stat, ver, back);
+  // status: bit7=CHIP_RDYn(0=ready), bit6..4=state(0..5 が正常値)
+  bool statPlausible = ((stat & 0x80) == 0) && (((stat >> 4) & 0x07) <= 0x05);
+  bool verOk = (ver == 0x14 || ver == 0x04 || ver == 0x17);
+  if (stat == 0x00 && ver == 0x00 && back == 0x00) {
+    Serial.printf("[DIAG]   no clock reaches chip -> SCK(GPIO%d) OPEN\n", PIN_SCK);
+  } else if (!statPlausible || !verOk) {
+    Serial.printf("[DIAG]   garbled/shifted bytes -> SCK(GPIO%d) BOUNCING (bad contact)\n", PIN_SCK);
+  } else if (back != 0x5A) {
+    Serial.printf("[DIAG]   clock+status OK but write lost -> MOSI(GPIO%d) suspect\n", PIN_MOSI);
+  }
+
+  cc1101Spi.end();
+
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_MISO, INPUT_PULLUP);   delay(2);
+  int csHighPu = digitalRead(PIN_MISO);
+  pinMode(PIN_MISO, INPUT_PULLDOWN); delay(2);
+  int csHighPd = digitalRead(PIN_MISO);
+
+  digitalWrite(PIN_CS, LOW);
+  pinMode(PIN_MISO, INPUT_PULLUP);   delay(2);
+  int csLowPu = digitalRead(PIN_MISO);
+  digitalWrite(PIN_CS, HIGH);
+
+  Serial.printf("[DIAG] MISO(GPIO%d) CS=H pu=%d pd=%d | CS=L pu=%d | GDO0=%d GDO2=%d\n",
+                PIN_MISO, csHighPu, csHighPd, csLowPu,
+                digitalRead(PIN_GDO0), digitalRead(PIN_GDO2));
+  if (csLowPu == 0 && csHighPu == 1) {
+    Serial.println("[DIAG] SO driven LOW at CS=L -> chip ALIVE. Suspect SCK/MOSI/CS wiring.");
+  } else if (csHighPu == 1 && csHighPd == 0 && csLowPu == 1) {
+    Serial.println("[DIAG] MISO FLOATING -> CC1101 unpowered (VDD/GND) or MISO wire open.");
+  } else if (csHighPu == 0) {
+    Serial.println("[DIAG] MISO stuck LOW with pull-up -> shorted to GND or wrong pin.");
+  }
+
+  pinMode(PIN_MISO, INPUT);
+  cc1101Spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  gpio_pullup_en((gpio_num_t)PIN_MISO);
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+}
+
 void ccSetPktFormat(uint8_t fmt) {
   uint8_t v = ccRead(0x08);  // PKTCTRL0
   v = (uint8_t)((v & ~0x30) | ((fmt & 0x03) << 4));
@@ -140,11 +228,32 @@ void ccEnableAsyncOnGDO2() {
   ccWrite(0x00, 0x0D);        // IOCFG2 = async data out
   ccWrite(0x02, 0x0E);        // IOCFG0 = Carrier Sense
 
-  // AGC: maximum sensitivity for 315MHz (bench-proven config; the in-vehicle
-  // issue is SNR/noise-floor, not gain, so keep the known-good sensitivity)
-  ccWrite(0x07, 0x01);  // AGCCTRL2: MAX_LNA_GAIN=000, MAGN_TARGET=001
-  ccWrite(0x06, 0x40);  // AGCCTRL1: AGC_LNA_PRIORITY=1
-  ccWrite(0x05, 0x0F);  // AGCCTRL0: HYST=00, WAIT=11, FILTER=11
+
+
+  if (ENABLE_DESK_TEST) {
+    // AGC: maximum sensitivity for 315MHz (bench-proven config; the in-vehicle
+    // issue is SNR/noise-floor, not gain, so keep the known-good sensitivity)
+    ccWrite(0x07, 0x01);  // AGCCTRL2: MAX_LNA_GAIN=000, MAGN_TARGET=001
+    ccWrite(0x06, 0x40);  // AGCCTRL1: AGC_LNA_PRIORITY=1
+    ccWrite(0x05, 0x0F);  // AGCCTRL0: HYST=00, WAIT=11, FILTER=11
+  } else {
+    ccWrite(0x07, 0x03);  // AGCCTRL2: MAGN_TARGET = 38 dB
+    ccWrite(0x06, 0x40);  // AGCCTRL1: 一旦 0x40 に（ブリキ缶内でのCSフリーズ感度維持）
+    ccWrite(0x05, 0x92);  // AGCCTRL0: 16サンプル平均
+    // ─── ここからFSK弱電界用の最適化 ───
+
+    // FOCCFG (0x19): 自動周波数補正（AFC）の動作を最強にする
+    // ログにあった +11kHz などの送信周波数ズレを、プリアンブルの数ビットの間に超高速で追いかけます。
+    // 設定値 0x36 = FOC_PRE_K=11 (高速追従), FOC_POST_K=1 (同期後も微追従), FOC_LIMIT=10 (許容制限最大)
+    ccWrite(0x19, 0x36);
+
+    // BSCFG (0x1A): ビット同期構成
+    // 弱電界でノイズに埋もれがちな「8.192 kbps」のパルスのタイミングクロックを
+    // 1サンプルの誤差もなく正確にロックするためのゲイン設定です。
+    // 設定値 0x1C = BS_PRE_K=01 (高速同期), BS_PRE_KP=10, BS_POST_K=0, BS_LIMIT=11 (最大許容)
+    ccWrite(0x1A, 0x1C);
+
+  }
 
   Serial.printf("IOCFG2=0x%02X IOCFG0=0x%02X PKTCTRL0=0x%02X\n",
                 ccRead(0x00), ccRead(0x02), ccRead(0x08));
@@ -412,14 +521,15 @@ ContinentalTPMSData decodeContinentalTPMS(const uint8_t* bits, int nBits, int bi
     d.sequence   = pkt[8] & 0x3F;          // bit5-0: sequence counter
   }
 
-  // Brand byte status: bit5 = 0 → pressure alert
-  d.pressureAlert = (d.brand & 0x20) == 0;
+  // Alert は Continental 純正の 0x98 のみ。Autel(0x80) は bit5=0 だが正常フレーム。
+  d.pressureAlert = (d.brand == 0x98);
 
   // Validity: CRC alone gives a 1/256 false-hit rate across the brute-force
-  // offset scan, so also require a real Continental brand byte (0xA8 normal /
-  // 0x98 pressure-alert) and physically plausible pressure/temperature.
+  // offset scan, so also require a known brand byte and physically plausible
+  // pressure/temperature.
+  //   0xA8 = Continental OEM 通常 / 0x98 = 同 圧力警報 / 0x80 = Autel MX-Sensor
   if (d.crcValid &&
-      (d.brand == 0xA8 || d.brand == 0x98) &&
+      (d.brand == 0xA8 || d.brand == 0x98 || d.brand == 0x80) &&
       d.pressurePsi >= 0.0f && d.pressurePsi <= 80.0f &&
       d.temperatureC >= -40.0f && d.temperatureC <= 100.0f &&
       d.sensorId != 0 && d.sensorId != 0xFFFFFFFF)
@@ -459,9 +569,17 @@ int trackSensor(const ContinentalTPMSData& data) {
   if (sensorRecordCount < 8) {
     slot = sensorRecordCount++;
   } else {
+    // ランダムCRC一致で生まれたゴミIDに既知センサーを追い出させない。
+    // 未知(lcdSlot<0)の中で最古を優先して潰し、無ければ全体の最古。
+    slot = -1;
+    for (int i = 0; i < 8; i++)
+      if (sensorRecords[i].lcdSlot < 0 &&
+          (slot < 0 || sensorRecords[i].lastSeenMs < sensorRecords[slot].lastSeenMs)) slot = i;
+    if (slot < 0) {
     slot = 0;
     for (int i = 1; i < 8; i++)
       if (sensorRecords[i].lastSeenMs < sensorRecords[slot].lastSeenMs) slot = i;
+    }
     if (sensorRecords[slot].lcdSlot >= 0)
       lcdSlotUsed[sensorRecords[slot].lcdSlot] = false;
   }
@@ -490,10 +608,12 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
                int preambleScore, bool isInv, int altRun, int altEnd,
                int dataStart) {
   ContinentalTPMSData diagResult = {};
-
+  
+  if(ENABLE_DETAILED_LOG)
+  {
   Serial.printf("\n==== [DIAG] sc=%d/36 altRun=%d edges=%d dur=%lums halfUs=%d pf=%.2f halfN=%d inv=%d ====\n",
                 preambleScore, altRun, n, (unsigned long)durMs, halfUs, pf, halfN, (int)isInv);
-
+  }
   // dt histogram
   {
     static uint16_t dtBins[61];
@@ -502,25 +622,25 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
       int bin = dts[i] / 5;
       if (bin >= 0 && bin < 61) dtBins[bin]++;
     }
-    Serial.printf("  dt-hist: ");
+    if(ENABLE_DETAILED_LOG) {Serial.printf("  dt-hist: ");}
     for (int top = 0; top < 5; top++) {
       int bestBin = -1; uint16_t bestCntB = 0;
       for (int b = 0; b < 61; b++)
         if (dtBins[b] > bestCntB) { bestCntB = dtBins[b]; bestBin = b; }
       if (bestBin < 0 || bestCntB == 0) break;
-      Serial.printf("%d-%dus(%d) ", bestBin * 5, bestBin * 5 + 4, bestCntB);
+      if(ENABLE_DETAILED_LOG) {Serial.printf("%d-%dus(%d) ", bestBin * 5, bestBin * 5 + 4, bestCntB);}
       dtBins[bestBin] = 0;
     }
-    Serial.println();
+    if(ENABLE_DETAILED_LOG) {Serial.println();}
   }
 
   // Edge timings (first 30)
   {
     int showN = min(n, 30);
-    Serial.printf("  edges[0..%d]: ", showN - 1);
+    if(ENABLE_DETAILED_LOG) {Serial.printf("  edges[0..%d]: ", showN - 1);}
     for (int i = 0; i < showN; i++)
-      Serial.printf("%u%c ", dts[i], lvs[i] ? 'H' : 'L');
-    Serial.println();
+      if(ENABLE_DETAILED_LOG) {Serial.printf("%u%c ", dts[i], lvs[i] ? 'H' : 'L');}
+    if(ENABLE_DETAILED_LOG) {Serial.println();}
   }
 
   // Raw bytes at estimated halfUs and at 122us
@@ -533,14 +653,14 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
       int tmpN = expandToHalfbits(dts, lvs, n, rate, tmpHalf, (int)sizeof(tmpHalf));
       int maxBytes = min(20, tmpN / 8);
       if (maxBytes < 2) continue;
-      Serial.printf("  raw@%dus(N=%d): ", rate, tmpN);
+      if(ENABLE_DETAILED_LOG) {Serial.printf("  raw@%dus(N=%d): ", rate, tmpN);}
       for (int b = 0; b < maxBytes; b++) {
         uint8_t v = 0;
         for (int bit = 0; bit < 8; bit++)
           v = (uint8_t)((v << 1) | (tmpHalf[b * 8 + bit] & 1));
-        Serial.printf("%02X ", v);
+        if(ENABLE_DETAILED_LOG) {Serial.printf("%02X ", v);}
       }
-      Serial.println();
+      if(ENABLE_DETAILED_LOG) {Serial.println();}
     }
   }
 
@@ -549,21 +669,21 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
     int dp = (dataStart >= 0) ? dataStart : altEnd;
     if (dp >= 0 && dp < halfN - 4) {
       int remaining = halfN - dp;
-      Serial.printf("  data@%d (%d half-bits = %d manch-bits):\n", dp, remaining, remaining / 2);
+      if(ENABLE_DETAILED_LOG) {Serial.printf("  data@%d (%d half-bits = %d manch-bits):\n", dp, remaining, remaining / 2);}
       for (int inv = 0; inv <= 1; inv++) {
         static uint8_t dbBits[400];
         int dbN = manchesterDecode(halfLv + dp, remaining,
                                    dbBits, (int)sizeof(dbBits), inv != 0);
         if (dbN < 3) continue;
         int dbBytes = min(15, (dbN + 7) / 8);
-        Serial.printf("    manchester inv=%d (%dbit): ", inv, dbN);
+        if(ENABLE_DETAILED_LOG) {Serial.printf("    manchester inv=%d (%dbit): ", inv, dbN);}
         for (int b = 0; b < dbBytes; b++) {
           uint8_t v = 0;
           for (int bit = 0; bit < 8 && (b * 8 + bit) < dbN; bit++)
             v = (uint8_t)((v << 1) | (dbBits[b * 8 + bit] & 1));
-          Serial.printf("%02X ", v);
+          if(ENABLE_DETAILED_LOG) {Serial.printf("%02X ", v);}
         }
-        Serial.println();
+        if(ENABLE_DETAILED_LOG) {Serial.println();}
 
         // Try Continental decode at bit offsets 0-7
         for (int bo = 0; bo <= 7 && bo + 64 <= dbN; bo++) {
@@ -580,7 +700,7 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
     }
   }
 
-  Serial.println("====");
+  if(ENABLE_DETAILED_LOG) {Serial.println("====");}
   return diagResult;
 }
 
@@ -620,17 +740,17 @@ void diagBigBurst(const uint16_t* dts, const uint8_t* lvs, int n, uint32_t durMs
         int sn = manchesterDecode(bigHalf + start, halfN - start, bits, (int)sizeof(bits), inv != 0);
         for (int bo = 0; bo <= 7 && bo + 64 <= sn; bo++) {
           ContinentalTPMSData t = decodeContinentalTPMS(bits, sn, bo);
-          // Only trust hits that look like a real Continental packet:
-          // brand==0xA8 and a plausible pressure. Kills random CRC collisions.
-          if (t.crcValid && t.brand == 0xA8 &&
+          // Only trust hits that look like a real packet: known brand byte and a
+          // plausible pressure. Kills random CRC collisions.
+          if (t.crcValid && (t.brand == 0xA8 || t.brand == 0x98 || t.brand == 0x80) &&
               t.pressurePsi >= 5.0f && t.pressurePsi <= 60.0f) {
             int slot = -1;
             for (int s = 0; s < seenN; s++)
               if (seenId[s] == t.sensorId) { slot = s; break; }
             if (slot < 0 && seenN < 32) { slot = seenN++; seenId[slot] = t.sensorId; seenCnt[slot] = 0; }
             if (slot >= 0 && seenCnt[slot] < 255) seenCnt[slot]++;
-            Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=A8 ID=%08X PSI=%.1f %dC seen=%d%s\n",
-                          hu, inv, start, bo, t.sensorId,
+            Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=%02X ID=%08X PSI=%.1f %dC seen=%d%s\n",
+                          hu, inv, start, bo, t.brand, t.sensorId,
                           t.pressurePsi, (int)t.temperatureC,
                           (slot >= 0) ? seenCnt[slot] : 0,
                           (slot >= 0 && seenCnt[slot] >= 2) ? "  ** REPEAT (real!) **" : "");
@@ -641,56 +761,103 @@ void diagBigBurst(const uint16_t* dts, const uint8_t* lvs, int n, uint32_t durMs
   }
 }
 
-// ====== setup() ======
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+// ====== CC1101 init (retryable) ======
+static bool g_radioReady = false;
 
-  cc1101Spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
-  pinMode(PIN_CS, OUTPUT);
-  digitalWrite(PIN_CS, HIGH);
-  pinMode(PIN_GDO0, INPUT);
-  pinMode(PIN_GDO2, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO2), isrGdo2, CHANGE);
+// 公称315.0MHz。実測 FREQEST が一貫して +22kHz だったため受信同調点を上げる
+// (センサー側 or CC1101モジュール水晶の誤差、約70ppm)。foff が 0 付近になれば正。
+static const float RX_FREQ_MHZ = 315.022f;
 
-  Serial.println("=== Continental/Nissan TPMS Receiver @ 315.0 MHz (v3) ===");
-  Serial.printf("Build env: %s\n", TPMS_ENV_NAME);
-  Serial.println("Sensor: S180052353E / 40700-4GA0B / ID:AE5C32C8");
-  Serial.println("Format: Brand(8)+ID(32)+Press(8)+Temp(8)+CRC8(8) = 64bit");
+// VERSION レジスタでチップの生死を見る（接触不良だと 0x00/0xFF になる）
+static bool ccVersionOk() {
+  uint8_t v = ccReadStatus(0x31);
+  return (v == 0x14 || v == 0x04 || v == 0x17);
+}
 
-  // CC1101 init: 315.0 MHz, 8.192 kbps (=1/122us), FSK dev 40 kHz
+// 手動POR -> radio.begin -> 受信設定 までを1回分。成功したら true。
+static bool radioTryInit(bool verbose = true) {
+  ccPowerOnReset();
+  uint8_t partnum = ccReadStatus(0x30);
+  uint8_t version = ccReadStatus(0x31);
+
+  // CC1101 init: 8.192 kbps (=1/122us), FSK dev 40 kHz
   // RxBW narrowed 325->135kHz to cut noise bandwidth (~+4dB sensitivity) for the
   // marginal in-vehicle link. Wide enough for +-40kHz deviation + crystal error.
-  int st = radio.begin(315.0, 8.192, 40.0, 135.0);
-  Serial.printf("radio.begin = %d\n", st);
-  if (st != RADIOLIB_ERR_NONE) {
-    // 車載時のみ発生（電源投入直後の電圧変動でCC1101がまだ応答しない）。
-    // 電源が安定するのを待って1回だけリトライする。
-    Serial.printf("!! CC1101 init FAILED (code=%d) -> retry in 500ms\n", st);
-    delay(500);
-    st = radio.begin(315.0, 8.192, 40.0, 135.0);
-    Serial.printf("radio.begin (retry) = %d\n", st);
+  int st = radio.begin(RX_FREQ_MHZ, 8.192, 40.0, 135.0);
+  if (verbose || st == RADIOLIB_ERR_NONE) {
+    Serial.printf("radio.begin = %d (PARTNUM=0x%02X VERSION=0x%02X)\n", st, partnum, version);
   }
-  if (st != RADIOLIB_ERR_NONE) {
-    // 無線が死んだまま走り続けても意味がないので、LCDに10秒表示してから再起動。
-    Serial.printf("!! CC1101 init FAILED (code=%d) -> reboot in 10s\n", st);
-    lcdBegin();
-    char detail[32];
-    snprintf(detail, sizeof(detail), "CC1101 code=%d", st);
-    lcdShowFatal("RF FAIL", detail);
-    for (int s = 10; s > 0; s--) { lcdShowFatalCountdown(s); delay(1000); }
-    Serial.println("Rebooting...");
-    Serial.flush();
-    ESP.restart();
-  }
+  if (st != RADIOLIB_ERR_NONE) return false;
 
   radio.setCrcFiltering(false);
   radio.setPromiscuousMode(true, true);
   radio.startReceive();
   ccEnableAsyncOnGDO2();
 
+  noInterrupts();
+  edgeN = 0;
+  burstReady = false;
   lastEdgeUs = micros();
-  lcdBegin();
+  interrupts();
+
+  attachInterrupt(digitalPinToInterrupt(PIN_GDO2), isrGdo2, CHANGE);
+  g_radioReady = true;
+  return true;
+}
+
+// チップが落ちたときの後始末。GDO2がフロートしてISR崐を起こすので割込を外す。
+static uint32_t g_radioLostCount = 0;
+
+static void radioMarkLost() {
+  detachInterrupt(digitalPinToInterrupt(PIN_GDO2));
+  noInterrupts();
+  edgeN = 0;
+  burstReady = false;
+  interrupts();
+  g_radioReady = false;
+  g_radioLostCount++;
+}
+
+// ====== setup() ======
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  cc1101Spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  // MISO に内部プルアップ。接点が離れたとき 0x00 ではなく 0xFF になるので
+  // 「線が開いた」と「チップが 0 を返している」を区別できる。
+  gpio_pullup_en((gpio_num_t)PIN_MISO);
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_GDO0, INPUT);
+  pinMode(PIN_GDO2, INPUT);
+  // GDO2 の割込は radioTryInit() 成功時に付ける（未初期化中の ISR 崐を避ける）
+
+  Serial.println("=== Continental/Nissan TPMS Receiver @ 315.0 MHz (v3) ===");
+  Serial.printf("Build env: %s\n", TPMS_ENV_NAME);
+  Serial.println("Sensor: S180052353E / 40700-4GA0B / ID:AE5C32C8");
+  Serial.println("Format: Brand(8)+ID(32)+Press(8)+Temp(8)+CRC8(8) = 64bit");
+
+  // RF が死んでいても画面は出したいので LCD を先に立ち上げる
+    lcdBegin();
+
+  // 車載(ダッシュボード)では電源の立ち上がりが遅く初回が -2 になる。
+  // 電源が安定するまで間隔を空けて粘る。ここで諦めても再起動はしない。
+  for (int attempt = 1; attempt <= 10 && !g_radioReady; attempt++) {
+    if (radioTryInit()) {
+      Serial.printf("CC1101 init OK (attempt %d)\n", attempt);
+      break;
+    }
+    Serial.printf("!! CC1101 init FAILED (attempt %d/10)\n", attempt);
+    delay(300);
+  }
+  if (!g_radioReady) {
+    // 再起動ループに入ると復帰の機会を失うので、loop() で再試行し続ける。
+    Serial.println("!! CC1101 not responding -> keep retrying in loop()");
+    ccDiagPins();
+    lcdShowFatal("RF FAIL", "CC1101 not found");
+    lcdShowFatalNote("retrying...");
+  }
 
   Serial.printf("Known sensors: %d\n", KNOWN_SENSOR_COUNT);
   for (int i = 0; i < KNOWN_SENSOR_COUNT; i++) {
@@ -703,6 +870,48 @@ void setup() {
 
 // ====== loop() ======
 void loop() {
+  // CC1101 が未初期化なら再起動せずに再試行し続ける（電源が安定すれば復帰する）
+  if (!g_radioReady) {
+    static uint32_t lastTryMs = 0;
+    static int retryCount = 0;
+    if (millis() - lastTryMs >= 500) {
+      lastTryMs = millis();
+      retryCount++;
+      char note[24];
+      snprintf(note, sizeof(note), "retry %d", retryCount);
+      lcdShowFatalNote(note);
+      bool verbose = (retryCount % 60 == 0);   // 30秒に1回だけログ
+      if (verbose) ccDiagPins();
+      if (radioTryInit(verbose)) {
+        Serial.printf("[%lus] CC1101 recovered after %d retries\n",
+                      (unsigned long)(millis() / 1000), retryCount);
+        retryCount = 0;
+        lcdForceRedraw();
+      }
+    }
+    return;
+  }
+
+  // 接触不良で途中に CC1101 が落ちると RSSI が -74 固定になり、GDO2 が暴れて
+  // ゴミバーストを拾い続ける。VERSION レジスタを 500ms 毎に見て自動再初期化する
+  // （配線を揺すワイグルテストで場所を特定できる間隔）。
+  {
+    static uint32_t lastHealthMs = 0;
+    if (millis() - lastHealthMs >= 500) {
+      lastHealthMs = millis();
+      if (!ccVersionOk()) {
+        Serial.printf("!! [%lus] CC1101 LOST (VERSION=0x%02X) #%lu -> re-init\n",
+                      (unsigned long)(millis() / 1000), ccReadStatus(0x31),
+                      (unsigned long)(g_radioLostCount + 1));
+        ccDiagPins();   // 線が開いている「その瞬間」に測らないと犯人が分からない
+        radioMarkLost();
+        lcdShowFatal("RF LOST", "CC1101 dropped");
+        lcdShowFatalNote("re-init...");
+        return;
+      }
+    }
+  }
+
   static uint32_t lastKickMs = 0;
   static uint32_t cntBurst = 0, cntInRange = 0;
   static uint32_t cntPreamble = 0, cntDecoded = 0;
@@ -719,6 +928,9 @@ void loop() {
   // Peak RSSI sampled DURING a burst -> how far the burst rises above the floor.
   static int      curBurstRssiMax = -127;   // resets per burst
   static int      bigRssiMax = -127;         // peak among big bursts (STATS)
+  // FREQEST at the burst peak: receiver-vs-sensor carrier offset. A large offset
+  // means we are losing sensitivity and 315.0MHz should be retuned.
+  static int      curBurstFreqEst = 0;
 
   uint32_t nowUs = micros();
 
@@ -743,12 +955,25 @@ void loop() {
   if ((millis() - lastRssiMs) >= 2) {
     lastRssiMs = millis();
     int r = ccRssiDbm();
+    // アンテナ導通の即時確認用。キーフォブ(315MHz)を押せば -40..-60dBm が出るはず。
+    // 何も出ない = アンテナ未接続を疑う。
+    {
+      static uint32_t lastStrongMs = 0;
+      if (r > -90 && (millis() - lastStrongMs) >= 200) {
+        lastStrongMs = millis();
+        Serial.printf("  [Strong] rssi=%d dBm\n", r);
+      }
+    }
     if (edgeN == 0) {
       if (r < rssiMin) rssiMin = r;
       if (r > rssiMax) rssiMax = r;
       rssiSum += r; rssiCnt++;
     } else if (!burstReady) {
-      if (r > curBurstRssiMax) curBurstRssiMax = r;
+      if (r > curBurstRssiMax) {
+        curBurstRssiMax = r;
+        uint8_t fe = ccReadStatus(0x32);          // FREQEST
+        curBurstFreqEst = (fe >= 128) ? (fe - 256) : fe;
+      }
     }
   }
 
@@ -767,7 +992,8 @@ void loop() {
       Serial.printf("    noiseFloor RSSI min=%d avg=%d max=%d dBm (n=%d)\n",
                     (rssiCnt ? rssiMin : 0), (rssiCnt ? (int)(rssiSum / rssiCnt) : 0),
                     (rssiCnt ? rssiMax : 0), rssiCnt);
-      Serial.printf("    bigBurst peak RSSI max=%d dBm\n", bigRssiMax);
+      Serial.printf("    bigBurst peak RSSI max=%d dBm  rfLost=%lu\n",
+                    bigRssiMax, (unsigned long)g_radioLostCount);
       for (int i = 0; i < sensorRecordCount; i++) {
         uint32_t age = (millis() - sensorRecords[i].lastSeenMs) / 1000;
         Serial.printf("  ID=%08X count=%d PSI=%.1f %.0fC slot=%d (%lus ago)\n",
@@ -807,6 +1033,8 @@ void loop() {
   if (bigBurst) cntBig++;
   int burstRssi = curBurstRssiMax;   // peak RSSI captured during this burst
   curBurstRssiMax = -127;
+  int burstFreqEst = curBurstFreqEst;
+  curBurstFreqEst = 0;
   if (bigBurst && burstRssi > bigRssiMax) bigRssiMax = burstRssi;
 
   // ---- Basic filters ----
@@ -827,7 +1055,7 @@ void loop() {
   if (halfUs < 100 || halfUs > 150) {
     // A packet-sized burst rejected here may be a real packet with a skewed
     // halfUs estimate -> dump raw timing (throttled) to read its true bit period.
-    if (bigBurst) {
+    if (bigBurst && ENABLE_DETAILED_LOG) {
       cntBigDropped++;
       static uint32_t lastBigMs = 0;
       if (millis() - lastBigMs >= 2000) {
@@ -860,11 +1088,12 @@ void loop() {
         diagBigBurst(dts, lvs, n, dur / 1000);
       }
     }
+    if(!ENABLE_DETAILED_LOG){delay(50);}
     radio.startReceive();
     return;
   }
 
-  if (peakFrac < 0.15f) {
+  if (peakFrac < 0.15f  && ENABLE_DETAILED_LOG) {
     if (bigBurst) {
       cntBigDropped++;
       static uint32_t lastBigMs = 0;
@@ -874,6 +1103,7 @@ void loop() {
                       n, (unsigned long)(dur / 1000), halfUs, peakFrac);
       }
     }
+    if(!ENABLE_DETAILED_LOG){delay(50);}
     radio.startReceive();
     return;
   }
@@ -885,8 +1115,8 @@ void loop() {
     static uint32_t lastIrMs = 0;
     if (millis() - lastIrMs >= 1000) {
       lastIrMs = millis();
-      Serial.printf("  [InRange] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
-                    n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);
+      if(ENABLE_DETAILED_LOG) {Serial.printf("  [InRange] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
+                    n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);}
     }
   }
 
@@ -949,10 +1179,18 @@ void loop() {
   }
 
   // ---- Check if enough data for normal decode ----
+  // decodeStart はプリアンブル終端の推定値で、数ハーフビット遅すぎることがある。
+  // 前方にも振るので、判定もその分だけ緩める。
+  static const int HALF_OFF_MIN = -8;
   int remaining = (decodeStart >= 0) ? halfN - decodeStart : 0;
-  if (remaining < 130 && !diagFound.valid) {
-    Serial.printf("  [NoData] dataStart=%d remaining=%d (need ~130 half-bits for 64-bit Continental)\n",
-                  decodeStart, remaining);
+  if (remaining < (130 + HALF_OFF_MIN) && !diagFound.valid ) {
+    if(ENABLE_DETAILED_LOG) {
+      Serial.printf("  [NoData] halfN=%d decodeStart=%d remaining=%d (need ~130 half-bits for 64-bit Continental)\n",
+                    halfN, decodeStart, remaining);
+    } else {
+      delay(50);
+    }
+    
     cntPreamble++;
     radio.startReceive();
     return;
@@ -967,7 +1205,7 @@ void loop() {
   float bestInvRate = 1.0f;
 
   for (int invMode = 0; invMode <= 1; invMode++) {
-    for (int halfOff = 0; halfOff <= 2; halfOff += 2) {  // 0 and 2 (even offsets)
+    for (int halfOff = HALF_OFF_MIN; halfOff <= 2; halfOff += 2) {  // even offsets
       int start = decodeStart + halfOff;
       if (start < 0 || start + 130 > halfN) continue;
 
@@ -991,6 +1229,18 @@ void loop() {
             bestData = trial;
             bestInvRate = invRate;
           }
+        } else if (trial.crcValid &&
+                   trial.temperatureC >= -40.0f && trial.temperatureC <= 100.0f &&
+                   trial.sensorId != 0 && trial.sensorId != 0xFFFFFFFF) {
+          // CRC は通ったが brand が 0xA8/0x98 以外。トリガーツール応答など
+          // 別ファンクションのフレームを取りこぼしていないか見るため出力する。
+          static uint32_t lastRejMs = 0;
+          if (millis() - lastRejMs >= 2000) {
+            lastRejMs = millis();
+            Serial.printf("  [CRCok-Rejected] brand=0x%02X ID=%08X PSI=%.1f %.0fC\n",
+                          trial.brand, trial.sensorId,
+                          trial.pressurePsi, trial.temperatureC);
+          }
         }
       }
     }
@@ -1005,8 +1255,11 @@ void loop() {
       static uint32_t lastFailMs = 0;
       if (millis() - lastFailMs >= 3000) {
         lastFailMs = millis();
-        Serial.printf("  [DecodeFail] No valid CRC-8 match found (halfUs=%d)\n", halfUs);
+        if (ENABLE_DETAILED_LOG) {
+          Serial.printf("  [DecodeFail] No valid CRC-8 match found (halfUs=%d)\n", halfUs);
+        }
       }
+      if(!ENABLE_DETAILED_LOG){delay(50);}
       radio.startReceive();
       return;
     }
@@ -1018,10 +1271,11 @@ void loop() {
   int recIdx = trackSensor(bestData);
 
   // ---- Serial output ----
-  Serial.printf("[Continental TPMS] ID=%08X brand=%02X PSI=%.1f kPa=%.0f bar=%.2f Temp=%dC CRC=%02X(%s) sc=%d/36 count=%d",
+  Serial.printf("[Continental TPMS] ID=%08X brand=%02X PSI=%.1f kPa=%.0f bar=%.2f Temp=%dC rssi=%d dBm CRC=%02X(%s) sc=%d/36 count=%d",
                 bestData.sensorId, bestData.brand,
                 bestData.pressurePsi, bestData.pressureKpa, bestData.pressureBar,
                 (int)bestData.temperatureC,
+                burstRssi,
                 bestData.crcReceived, bestData.crcValid ? "OK" : "NG",
                 preambleScore,
                 sensorRecords[recIdx].count);
@@ -1029,8 +1283,8 @@ void loop() {
   if (bestData.hasExtra) Serial.printf(" extra=%02X seq=%d", bestData.extraByte, bestData.sequence);
   if (bestData.pressureAlert) Serial.printf(" ALERT");
   if (bestData.batteryLow) Serial.printf(" BATLOW");
-  Serial.printf(" (h=%d pf=%.2f ir=%.2f)\n",
-                halfUs, peakFrac, bestInvRate);
+  Serial.printf(" (h=%d pf=%.2f ir=%.2f foff=%+.1fkHz)\n",
+                halfUs, peakFrac, bestInvRate, burstFreqEst * 1.587f);
 
   // ---- LCD update (CRC verified = trusted) ----
   int lcdSlot = sensorRecords[recIdx].lcdSlot;
@@ -1038,7 +1292,7 @@ void loop() {
     lcdUpdateTire(lcdSlot, bestData.sensorId,
                   bestData.pressurePsi, bestData.pressureBar,
                   bestData.pressureKpa, bestData.temperatureC);
-
+  if(!ENABLE_DETAILED_LOG){delay(50);}
   radio.startReceive();
 
   if (millis() - lastKickMs > 3000) {
