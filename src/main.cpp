@@ -51,6 +51,9 @@ static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
 #define ENABLE_DETAILED_LOG false
 #endif
 
+// ====== receive wait time (ms) ======
+static const int RECEIVE_WAIT_TIME_MS = 50;
+
 // ====== Pin wiring ======
 static const int PIN_CS   = 10;
 static const int PIN_SCK  = 12;
@@ -1088,7 +1091,7 @@ void loop() {
         diagBigBurst(dts, lvs, n, dur / 1000);
       }
     }
-    if(!ENABLE_DETAILED_LOG){delay(50);}
+    if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
     radio.startReceive();
     return;
   }
@@ -1103,7 +1106,7 @@ void loop() {
                       n, (unsigned long)(dur / 1000), halfUs, peakFrac);
       }
     }
-    if(!ENABLE_DETAILED_LOG){delay(50);}
+    if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
     radio.startReceive();
     return;
   }
@@ -1188,7 +1191,7 @@ void loop() {
       Serial.printf("  [NoData] halfN=%d decodeStart=%d remaining=%d (need ~130 half-bits for 64-bit Continental)\n",
                     halfN, decodeStart, remaining);
     } else {
-      delay(50);
+      delay(RECEIVE_WAIT_TIME_MS);
     }
     
     cntPreamble++;
@@ -1259,7 +1262,7 @@ void loop() {
           Serial.printf("  [DecodeFail] No valid CRC-8 match found (halfUs=%d)\n", halfUs);
         }
       }
-      if(!ENABLE_DETAILED_LOG){delay(50);}
+      if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
       radio.startReceive();
       return;
     }
@@ -1292,7 +1295,7 @@ void loop() {
     lcdUpdateTire(lcdSlot, bestData.sensorId,
                   bestData.pressurePsi, bestData.pressureBar,
                   bestData.pressureKpa, bestData.temperatureC);
-  if(!ENABLE_DETAILED_LOG){delay(50);}
+  if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
   radio.startReceive();
 
   if (millis() - lastKickMs > 3000) {
