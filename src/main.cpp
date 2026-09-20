@@ -38,7 +38,7 @@
 #endif
 
 #ifndef TPMS_ENV_DEV
-#define TPMS_ENV_DEV 0
+#define TPMS_ENV_DEV false
 #endif
 
 #if TPMS_ENV_DEV
@@ -265,7 +265,13 @@ void ccEnableAsyncOnGDO2() {
 }
 
 // ====== Burst capture (ISR) ======
-static const uint32_t BURST_GAP_US = 20000;   // 20ms gap = end of burst
+// ==== コンチネンタル/Autel MXセンサー専用のバースト制御定数 ====
+// 1パケット（64bit＋α）を構成する想定エッジ数の境界線
+static const int      CONTINENTAL_PACKET_EDGES = 140;
+// 停車中（単発送信）：ノイズを吸い込む前にキレよくドアを閉めるタイムアウト（1.5ms）
+static const uint32_t GAP_PARK_MODE_US         = 1500;
+// 走行中（高速連発）：パケット同士のわずかな切れ目を捉えるタイムアウト（2.5ms）
+static const uint32_t GAP_DRIVE_MODE_US        = 2500;
 static const int MAX_EDGES = 4000;
 static const int MIN_EDGES = 40;
 
@@ -285,7 +291,7 @@ void IRAM_ATTR isrGdo2() {
 
   if (dt > 0 && dt < 10) return;  // glitch
 
-  if (dt > BURST_GAP_US && edgeN > 0) {
+  if (dt > GAP_DRIVE_MODE_US && edgeN > 0) {
     if (edgeN >= MIN_EDGES) {
       burstEndUs = now - dt;
       burstReady = true;
@@ -784,9 +790,10 @@ static bool radioTryInit(bool verbose = true) {
   uint8_t version = ccReadStatus(0x31);
 
   // CC1101 init: 8.192 kbps (=1/122us), FSK dev 40 kHz
-  // RxBW narrowed 325->135kHz to cut noise bandwidth (~+4dB sensitivity) for the
+  // RxBW narrowed 325->162kHz to cut noise bandwidth (~+4dB sensitivity) for the
   // marginal in-vehicle link. Wide enough for +-40kHz deviation + crystal error.
-  int st = radio.begin(RX_FREQ_MHZ, 8.192, 40.0, 135.0);
+  // MX-Sensor (Autel) は 162kHzのほうがよさそう
+  int st = radio.begin(RX_FREQ_MHZ, 8.192, 40.0, 162.0);
   if (verbose || st == RADIOLIB_ERR_NONE) {
     Serial.printf("radio.begin = %d (PARTNUM=0x%02X VERSION=0x%02X)\n", st, partnum, version);
   }
@@ -941,11 +948,21 @@ void loop() {
   if (!burstReady && edgeN >= (MAX_EDGES - 10)) {
     noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
   }
-  if (!burstReady && edgeN > 30 && (nowUs - burstStartUs > 200000)) {
-    noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
-  }
-  if (!burstReady && edgeN >= MIN_EDGES && (nowUs - lastEdgeUs > BURST_GAP_US)) {
-    noInterrupts(); burstReady = true; burstEndUs = lastEdgeUs; interrupts();
+  // 【コンチネンタル/Autel完全ハイブリッド対応】
+  // エッジ数に応じた動的なパケット終了判定（可変タイムアウト）
+  if (!burstReady && edgeN >= MIN_EDGES) {
+    
+    // ① すでに1パケット分以上のエッジが溜まっている場合（走行中バーストなど）
+    // 連発パケットの切れ目を確実に捉えるため、少し広めのドライブモード用ギャップで判定
+    if (edgeN >= CONTINENTAL_PACKET_EDGES && (nowUs - lastEdgeUs > GAP_DRIVE_MODE_US)) {
+      noInterrupts(); burstReady = true; burstEndUs = lastEdgeUs; interrupts();
+    }
+    
+    // ② エッジがまだ少ない場合（停車中の単発パケットなど）
+    // お尻に環境ノイズを吸い込んでデータが汚染される前に、短いパークモード用ギャップで即座に閉じる
+    else if (edgeN < CONTINENTAL_PACKET_EDGES && (nowUs - lastEdgeUs > GAP_PARK_MODE_US)) {
+      noInterrupts(); burstReady = true; burstEndUs = lastEdgeUs; interrupts();
+    }
   }
 
   // LCD refresh
