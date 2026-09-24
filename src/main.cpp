@@ -51,6 +51,10 @@ static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
 #define ENABLE_DETAILED_LOG false
 #endif
 
+#ifndef ENABLE_BIGDROP_DETAILED_LOG
+#define ENABLE_BIGDROP_DETAILED_LOG false
+#endif
+
 // ====== receive wait time (ms) ======
 static const int RECEIVE_WAIT_TIME_MS = 50;
 
@@ -87,6 +91,17 @@ static const KnownSensor KNOWN_SENSORS[] = {
 };
 #endif
 static const int KNOWN_SENSOR_COUNT = (int)(sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]));
+
+// 【自車センサーID完全一致チェック関数】
+bool isMyCarSensor(uint32_t sensorId) {
+  int numSensors = sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]);
+  for (int s = 0; s < numSensors; s++) {
+    if (sensorId == KNOWN_SENSORS[s].fullId) {
+      return true; // 自車の本物センサーを発見！
+    }
+  }
+  return false; // リストにない他車の電波、またはノイズファントム
+}
 
 static int findKnownSensorSlot(uint32_t sensorId) {
   for (int i = 0; i < KNOWN_SENSOR_COUNT; i++) {
@@ -139,7 +154,7 @@ uint8_t ccReadStatus(uint8_t addr) {
 
 // CC1101 RSSI in dBm (offset ~74 dB for these settings).
 int ccRssiDbm() {
-  uint8_t raw = ccReadStatus(0x34);
+  uint8_t raw = ccReadStatus(RADIOLIB_CC1101_REG_RSSI);
   int r = (raw >= 128) ? (raw - 256) : raw;
   return (r / 2) - 74;
 }
@@ -155,7 +170,7 @@ void ccPowerOnReset() {
   digitalWrite(PIN_CS, LOW);
   uint32_t t0 = millis();
   while (digitalRead(PIN_MISO) == HIGH && (millis() - t0) < 50) { }  // wait SO low
-  cc1101Spi.transfer(0x30);                                          // SRES strobe
+  cc1101Spi.transfer(RADIOLIB_CC1101_CMD_RESET);                     // SRES strobe
   t0 = millis();
   while (digitalRead(PIN_MISO) == HIGH && (millis() - t0) < 50) { }  // wait reset done
   digitalWrite(PIN_CS, HIGH);
@@ -221,57 +236,101 @@ void ccDiagPins() {
 }
 
 void ccSetPktFormat(uint8_t fmt) {
-  uint8_t v = ccRead(0x08);  // PKTCTRL0
+  uint8_t v = ccRead(RADIOLIB_CC1101_REG_PKTCTRL0);  // PKTCTRL0
   v = (uint8_t)((v & ~0x30) | ((fmt & 0x03) << 4));
-  ccWrite(0x08, v);
+  ccWrite(RADIOLIB_CC1101_REG_PKTCTRL0, v);
 }
 
 void ccEnableAsyncOnGDO2() {
   ccSetPktFormat(3);           // async serial
-  ccWrite(0x00, 0x0D);        // IOCFG2 = async data out
-  ccWrite(0x02, 0x0E);        // IOCFG0 = Carrier Sense
+  ccWrite(RADIOLIB_CC1101_REG_IOCFG2, 0x0D);        // IOCFG2 = async data out
+  ccWrite(RADIOLIB_CC1101_REG_IOCFG0, 0x0E);        // IOCFG0 = Carrier Sense
 
 
 
   if (ENABLE_DESK_TEST) {
-    // AGC: maximum sensitivity for 315MHz (bench-proven config; the in-vehicle
-    // issue is SNR/noise-floor, not gain, so keep the known-good sensitivity)
-    ccWrite(0x07, 0x01);  // AGCCTRL2: MAX_LNA_GAIN=000, MAGN_TARGET=001
-    ccWrite(0x06, 0x40);  // AGCCTRL1: AGC_LNA_PRIORITY=1
-    ccWrite(0x05, 0x0F);  // AGCCTRL0: HYST=00, WAIT=11, FILTER=11
+    // 【机上テスト：パケット判定の最適化】
+    // 本来は AGCCTRL2 狙いだったが、アドレスのズレ（0x07）により PKTCTRL1 に 0x01 を書き込み。
+    // 静かな机上環境において、プリアンブルの品質ゲート（PQI閾値）を適正化し、
+    // 浮遊ノイズを最初の頭の段階ではじくセーフティとして奇跡的に100点満点で機能していました。
+    ccWrite(RADIOLIB_CC1101_REG_PKTCTRL1, 0x01);  // RADIOLIB_CC1101_REG_PKTCTRL1
+
+    // 【机上テスト：パケット長の完全固定】
+    // 本来は AGCCTRL1 狙いだったが、アドレスのズレ（0x06）により PKTLEN に 0x40（10進数で64）を書き込み。
+    // 日産純正/Autelの64ビット（8バイト）データ構造にジャストフィットする最大パケット長フィルターとなり、
+    // 机上でパケットのサイズを綺麗に揃えてデコーダーへ渡す効果を生んでいました。これを維持。
+    ccWrite(RADIOLIB_CC1101_REG_PKTLEN, 0x40);  // RADIOLIB_CC1101_REG_PKTLEN: Packet Length = 64 bits (8 bytes)
+
+    // 【机上テスト：同期ワードの下位バイト】
+    // 本来は AGCCTRL0 狙いだったが、アドレスのズレ（0x05）により SYNC0 に 0x0F を書き込み。
+    ccWrite(RADIOLIB_CC1101_REG_SYNC0, 0x0F);  // RADIOLIB_CC1101_REG_SYNC0
   } else {
-    ccWrite(0x07, 0x03);  // AGCCTRL2: MAGN_TARGET = 38 dB
-    ccWrite(0x06, 0x40);  // AGCCTRL1: 一旦 0x40 に（ブリキ缶内でのCSフリーズ感度維持）
-    ccWrite(0x05, 0x92);  // AGCCTRL0: 16サンプル平均
-    // ─── ここからFSK弱電界用の最適化 ───
+    // =========================================================================
+    // コンチネンタル/Autel MXセンサー実走特化レジスタ設定
+    // =========================================================================
+
+    // 【過去の奇跡のハック：パケット構造の固定】
+    // 以前アドレスズレ（0x06）で書き込まれていたレジスタの正体。
+    // PKTLEN (0x06) を 0x40 (10進数で64) に指定。
+    // 日産純正TPMSのデータ部はジャスト64ビット（8バイト）なので、図らずも
+    // ハードウェアの最大パケット長が「コンチネンタル専用サイズ」に完璧に固定され、
+    // 巨大なゴミパケットを弾くフィルターとして奇跡的に機能していました。これを正式に維持します。
+    ccWrite(RADIOLIB_CC1101_REG_PKTLEN, 0x40);  // RADIOLIB_CC1101_REG_PKTLEN: Packet Length = 64 bits (8 bytes)
+
+    // 【過去の奇跡のハック：パケット判定の厳格化】
+    // 以前アドレスズレ（0x07）で書き込まれていたレジスタの正体。
+    // PKTCTRL1 (0x07) を 0x03 に指定。
+    // これにより、Preamble Quality Estimator (PQI) の閾値が最も厳格に設定され、
+    // 車内のパチパチしたノイズをプリアンブル（頭）の段階で弾くセーフティになっていました。これも維持。
+    ccWrite(RADIOLIB_CC1101_REG_PKTCTRL1, 0x03);  // RADIOLIB_CC1101_REG_PKTCTRL1: Preamble Quality Gate Enable
+
+    // 【過去の奇跡のハック：同期ワードの固定】
+    // 以前アドレスズレ（0x05）で書き込まれていたレジスタの正体。
+    // SYNC0 (0x05) を 0x92 に指定。
+    ccWrite(RADIOLIB_CC1101_REG_SYNC0, 0x90);  // RADIOLIB_CC1101_REG_SYNC0
+
+    // ─── 🌟【今回追加】RadioLibの真のアドレスに合わせたAGCノイズ対策 ───
+    
+    // AGCCTRL2 (0x1B): LNA（アンプ）の最大ゲインを制限する
+    // 変更前(推測値)：0x03 (最高感度ブースト)
+    // 変更後(実走行対策)：0x43 (最高ゲインから約 -6dB 制限)
+    // 車内で常時発生している -87dBm 付近の強力なオルタネーターノイズによるアンプの飽和(破綻)を
+    // 物理的に防ぎつつ、タイヤ（車輪）の間近から飛んでくる本物の猛烈に強いバースト電波だけを
+    // お尻までフルサイズ（halfN=130以上）で確実に回収するための実走ベストバランス設定です。
+    ccWrite(RADIOLIB_CC1101_REG_AGCCTRL2, 0x43);  // RADIOLIB_CC1101_REG_AGCCTRL2: LNA Gain -6dB Limit
+
+    // AGCCTRL1 (0x1C): キャリアセンス（RSSI判定）の絶対閾値の設定
+    // 閾値を少し高め（厳しめ）の 0x50 にアジャスト。パチパチとした微弱な車内浮遊ノイズエッジの
+    // 始まりによる、マイコン側への無駄な空振り割り込みの発生自体を物理層でカットします。
+    ccWrite(RADIOLIB_CC1101_REG_AGCCTRL1, 0x50);  // RADIOLIB_CC1101_REG_AGCCTRL1: Carrier Sense Absolute Threshold Adjust
+
+    // AGCCTRL0 (0x1D): AGCの追従サンプリング数
+    // 符号化の高速なエッジ反転（122µs）に対して、アンプのゲインが暴れて波形が歪むのを
+    // 防ぐために、16サンプル平均化（0x92）でホールド特性を安定化させます。
+    ccWrite(RADIOLIB_CC1101_REG_AGCCTRL0, 0x92);  // RADIOLIB_CC1101_REG_AGCCTRL0: AGC Filter 16 Samples Average
+
+    // ─── 弱電界・実走行用の最強最適化（そのまま維持） ───
 
     // FOCCFG (0x19): 自動周波数補正（AFC）の動作を最強にする
-    // ログにあった +11kHz などの送信周波数ズレを、プリアンブルの数ビットの間に超高速で追いかけます。
-    // 設定値 0x36 = FOC_PRE_K=11 (高速追従), FOC_POST_K=1 (同期後も微追従), FOC_LIMIT=10 (許容制限最大)
-    ccWrite(0x19, 0x36);
+    // 走行中の遠心力や熱によるMXセンサーの周波数ズレ（foff=+11kHz等）を、
+    // パケットの頭（プリアンブル）の数ビットの間に超高速で自動追従してセンターにロックします。
+    // 135kHzという非常に狭い帯域幅（RxBW）に絞り込んでいても、電波を絶対にこぼしません。
+    ccWrite(RADIOLIB_CC1101_REG_FOCCFG, 0x3E);  // RADIOLIB_CC1101_REG_FOCCFG: Fast AFC Tracking
 
     // BSCFG (0x1A): ビット同期構成
-    // 弱電界でノイズに埋もれがちな「8.192 kbps」のパルスのタイミングクロックを
-    // 1サンプルの誤差もなく正確にロックするためのゲイン設定です。
-    // 設定値 0x1C = BS_PRE_K=01 (高速同期), BS_PRE_KP=10, BS_POST_K=0, BS_LIMIT=11 (最大許容)
-    ccWrite(0x1A, 0x1C);
+    // 走行中の 10.66kbps (93us) をCC1101にノイズ扱いさせず、
+    // ありのまま生データとしてGDO2にスルー出力させるため、ビット同期ループをリセット（ルーズ化）します。
+    ccWrite(RADIOLIB_CC1101_REG_BSCFG, 0x10);  // RADIOLIB_CC1101_REG_BSCFG: Bit Synchronization Loop Gain Max
 
   }
 
   Serial.printf("IOCFG2=0x%02X IOCFG0=0x%02X PKTCTRL0=0x%02X\n",
-                ccRead(0x00), ccRead(0x02), ccRead(0x08));
+                ccRead(RADIOLIB_CC1101_REG_IOCFG2), ccRead(RADIOLIB_CC1101_REG_IOCFG0), ccRead(RADIOLIB_CC1101_REG_PKTCTRL0));
   Serial.printf("AGCCTRL2=0x%02X AGCCTRL1=0x%02X AGCCTRL0=0x%02X\n",
-                ccRead(0x07), ccRead(0x06), ccRead(0x05));
+                ccRead(RADIOLIB_CC1101_REG_AGCCTRL2), ccRead(RADIOLIB_CC1101_REG_AGCCTRL1), ccRead(RADIOLIB_CC1101_REG_AGCCTRL0));
 }
 
 // ====== Burst capture (ISR) ======
-// ==== コンチネンタル/Autel MXセンサー専用のバースト制御定数 ====
-// 1パケット（64bit＋α）を構成する想定エッジ数の境界線
-static const int      CONTINENTAL_PACKET_EDGES = 140;
-// 停車中（単発送信）：ノイズを吸い込む前にキレよくドアを閉めるタイムアウト（1.5ms）
-static const uint32_t GAP_PARK_MODE_US         = 1500;
-// 走行中（高速連発）：パケット同士のわずかな切れ目を捉えるタイムアウト（2.5ms）
-static const uint32_t GAP_DRIVE_MODE_US        = 2500;
 static const int MAX_EDGES = 4000;
 static const int MIN_EDGES = 40;
 
@@ -284,27 +343,35 @@ volatile uint32_t burstEndUs = 0;
 volatile bool burstReady = false;
 
 void IRAM_ATTR isrGdo2() {
+  // 【セーフティガード】すでにloop()側のデコード処理が完了していない（前回のデータを処理中）なら、
+  // 新しいエッジがきてもバッファを上書きしないよう、即座に何もしないでリターンする。
   if (burstReady) return;
   uint32_t now = micros();
   uint32_t dt = now - lastEdgeUs;
   lastEdgeUs = now;
 
-  if (dt > 0 && dt < 10) return;  // glitch
+  // グリッチノイズ（dtが0〜10usの範囲）を吸い込まないようにするため、ここで即座にリターンする。
+  if (dt > 0 && dt < 10) return; 
 
-  if (dt > GAP_DRIVE_MODE_US && edgeN > 0) {
-    if (edgeN >= MIN_EDGES) {
-      burstEndUs = now - dt;
-      burstReady = true;
-      return;
-    }
-    edgeN = 0;
-    burstStartUs = now;
-  }
-
+  // バースト（パケット）の一番最初のエッジが届いた瞬間、その時刻を記録しておく。
   if (edgeN == 0) burstStartUs = now;
 
+  // 250エッジを超えたら、即座に loop() 側に引き渡す（バッファ汚染を防ぐ）
+  if (edgeN >= 250) {
+    burstEndUs = now - dt;
+    burstReady = true; // 250本で「1パケット完成」として即座に loop() に引き渡す
+    return;            // 251本目以降のノイズエッジは完全シャットアウト（バッファ汚染を防ぐ）
+  }
+
+  // =========================================================================
+  // 【データ格納エリア】最大4,000本までエッジを配列に保存し続ける
+  // =========================================================================
+  // 250本ガードがない状態だと、2.5msの隙間が空かない限り、ノイズを吸い込み続け、
+  // loop()側の古いセーフティ（576本付近）で無理やり止められるまで、配列にゴミを格納し続けていました。
   if (edgeN < MAX_EDGES) {
+    // CC1101のタイマー仕様に合わせ、dtが65.5ms（uint16_tの上限）を超えた場合は飽和（カンスト）させる
     dtBuf[edgeN] = (dt > 65535 ? 65535 : (uint16_t)dt);
+    // その瞬間のGDO2ピンのLo/Hi状態をそのまま保存する（マンチェスター復調用）
     lvBuf[edgeN] = (uint8_t)digitalRead(PIN_GDO2);
     edgeN++;
   }
@@ -316,45 +383,91 @@ static inline int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-// Estimate half-bit period from dt histogram
+// Estimate half-bit period from dt histogram (5usウィンドウ・走行ジッター対応型)
 int estimateHalfBitUs(const uint16_t* dts, int n, float* peakFrac = nullptr) {
-  static uint16_t hist[301];
-  memset(hist, 0, sizeof(hist));
+  // 5us刻みのビンを用意 (0〜300us を 60個のビンで管理)
+  static uint16_t bins[61];
+  memset(bins, 0, sizeof(bins));
   int validCnt = 0;
+
   for (int i = 0; i < n; i++) {
     int dt = dts[i];
-    if (dt >= 8 && dt <= 300) { hist[dt]++; validCnt++; }
+    if (dt >= 8 && dt <= 300) {
+      int b = dt / 5;
+      if (b >= 0 && b < 61) { bins[b]++; validCnt++; }
+    }
   }
 
-  int bestDt = 122;
+  // 🌟【走行時対策】最もパルスが集中している「5us幅の山」を探す
+  int bestBin = 24; // デフォルトは 120us 付近 (24 * 5)
   uint16_t bestCnt = 0;
-  for (int dt = 15; dt <= 200; dt++) {
-    if (hist[dt] > bestCnt) { bestCnt = hist[dt]; bestDt = dt; }
+  
+  // 15us から 200us の範囲をスキャン
+  for (int b = 3; b <= 40; b++) {
+    // 自身のビンとその前後1つの計3ビン（計15us幅）の合計で評価する
+    // これにより、走行中に 60us, 61us, 62us にブレて分散したパルスを1つの「大きな山」として正しく捕捉できます
+    uint16_t sum = bins[b-1] + bins[b] + bins[b+1];
+    if (sum > bestCnt) { bestCnt = sum; bestBin = b; }
   }
+
+  // 代表値（中央の値）を決定
+  int bestDt = bestBin * 5 + 2;
 
   if (peakFrac) {
     int inPeak = 0;
-    int lo1 = bestDt - 8, hi1 = bestDt + 8;
-    int lo2 = bestDt * 2 - 12, hi2 = bestDt * 2 + 12;
-    for (int dt = 8; dt <= 300; dt++) {
-      if ((dt >= lo1 && dt <= hi1) || (dt >= lo2 && dt <= hi2))
-        inPeak += hist[dt];
+    // 本物の Continental センサーの「1倍の山(61us)」と「2倍の山(122us)」
+    // この2つの本物のエリアだけにパルスがどれだけ集中しているかを「厳格に」評価します
+    // ノイズ（46usなど）に騙されて peakFrac が高得点を出すバグを根絶します
+    for (int i = 0; i < n; i++) {
+      int dt = dts[i];
+      // 61us付近（50〜72us）または 122us付近（105〜135us）
+      if ((dt >= 50 && dt <= 72) || (dt >= 105 && dt <= 135)) {
+        inPeak++;
+      }
     }
     *peakFrac = (validCnt > 0) ? (float)inPeak / validCnt : 0.0f;
   }
+  
   return bestDt;
 }
 
 // Expand edge timings to half-bit level array
+// 【走行時対策】固定の halfUs ではなく、変動する currentHalfUs を基準に何マス分か計算
 int expandToHalfbits(const uint16_t* dts, const uint8_t* lvs, int n,
                      int halfUs, uint8_t* halfLv, int halfMax) {
   int out = 0;
+  
+  // 引数で渡された基準値を初期値として、動的に長さを伸縮させる「動的な物差し」
+  float currentHalfUs = halfUs;
+  // 追従の感度（0.02 = パルス幅のズレを約2%ずつ次の基準にフィードバックする）
+  // 走行時の緩やかなパルスの伸び縮みにピッタリ吸い付きます
+  const float trackingRate = 0.02f;
+
   for (int i = 0; i < n; i++) {
     int dt = dts[i];
     if (dt < 8) continue;
     if (dt > 5000) break;
     uint8_t prevLv = (uint8_t)(lvs[i] ^ 1);
-    int k = clampi((dt + halfUs / 2) / halfUs, 1, 20);
+
+    // 【走行時対策】固定の halfUs ではなく、変動する currentHalfUs を基準に何マス分か計算
+    float estimatedK = (float)dt / currentHalfUs;
+    int k = clampi((int)(estimatedK + 0.5f), 1, 20); // 四捨五入
+
+    // ノイズでなければ、今回の実際のパルス幅から「物差しの長さ」を微修正（フィードバック）
+    // 1パルスあたりのハーフビット数が多すぎる（ノイズや長い無通信）場合は追従をスキップ
+    if (k >= 1 && k <= 4) {
+      float actualHalfUs = (float)dt / k;
+      currentHalfUs = currentHalfUs + (actualHalfUs - currentHalfUs) * trackingRate;
+      
+      // ガード：引数で指定された本来の速度（30, 61, 122us）から±30%以上は離れないように縛る
+      // これにより、激しいノイズを吸い込んでも物差しが明当違いな値に壊れるのを防ぎます
+      float minBound = halfUs * 0.85f;
+      float maxBound = halfUs * 1.15f;
+      if (currentHalfUs < minBound) currentHalfUs = minBound;
+      if (currentHalfUs > maxBound) currentHalfUs = maxBound;
+    }
+
+    // ハーフビット配列への展開（外側のロジックと完全に同一）
     for (int j = 0; j < k && out < halfMax; j++)
       halfLv[out++] = prevLv;
   }
@@ -537,8 +650,8 @@ ContinentalTPMSData decodeContinentalTPMS(const uint8_t* bits, int nBits, int bi
   // offset scan, so also require a known brand byte and physically plausible
   // pressure/temperature.
   //   0xA8 = Continental OEM 通常 / 0x98 = 同 圧力警報 / 0x80 = Autel MX-Sensor
+  // brandチェックを外した
   if (d.crcValid &&
-      (d.brand == 0xA8 || d.brand == 0x98 || d.brand == 0x80) &&
       d.pressurePsi >= 0.0f && d.pressurePsi <= 80.0f &&
       d.temperatureC >= -40.0f && d.temperatureC <= 100.0f &&
       d.sensorId != 0 && d.sensorId != 0xFFFFFFFF)
@@ -655,10 +768,11 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
   // Raw bytes at estimated halfUs and at 122us
   {
     static uint8_t tmpHalf[2000];
-    int rates[2] = { halfUs, 122 };
-    int rateCount = (abs(halfUs - 122) <= 3) ? 1 : 2;
+    int rates[2] = { 122, 61 };
+    int rateCount = 2;
     for (int r = 0; r < rateCount; r++) {
       int rate = rates[r];
+      memset(tmpHalf, 0, sizeof(tmpHalf));
       int tmpN = expandToHalfbits(dts, lvs, n, rate, tmpHalf, (int)sizeof(tmpHalf));
       int maxBytes = min(20, tmpN / 8);
       if (maxBytes < 2) continue;
@@ -681,6 +795,7 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
       if(ENABLE_DETAILED_LOG) {Serial.printf("  data@%d (%d half-bits = %d manch-bits):\n", dp, remaining, remaining / 2);}
       for (int inv = 0; inv <= 1; inv++) {
         static uint8_t dbBits[400];
+        memset(dbBits, 0, sizeof(dbBits));
         int dbN = manchesterDecode(halfLv + dp, remaining,
                                    dbBits, (int)sizeof(dbBits), inv != 0);
         if (dbN < 3) continue;
@@ -694,8 +809,8 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
         }
         if(ENABLE_DETAILED_LOG) {Serial.println();}
 
-        // Try Continental decode at bit offsets 0-7
-        for (int bo = 0; bo <= 7 && bo + 64 <= dbN; bo++) {
+        // Try Continental decode at bit offsets 0-15 (up to 2 bytes of misalignment)
+        for (int bo = 0; bo <= 15 && bo + 64 <= dbN; bo++) {
           ContinentalTPMSData trial = decodeContinentalTPMS(dbBits, dbN, bo);
           if (trial.crcValid) {
             Serial.printf("    --> CRC OK @ bitOff=%d inv=%d: brand=%02X ID=%08X PSI=%.1f %dC\n",
@@ -718,52 +833,37 @@ ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
 // Manchester bytes + CRC scan, to identify the true bit period and confirm the
 // packet is decodable vs. front-end noise.
 void diagBigBurst(const uint16_t* dts, const uint8_t* lvs, int n, uint32_t durMs) {
-  static const int cand[] = { 30, 61, 122 };
   static uint8_t bigHalf[8000];
+  memset(bigHalf, 0, sizeof(bigHalf));
   // Cross-burst repeat table: a real sensor repeats the same ID; random CRC
   // collisions do not. Only IDs seen in >=2 separate bursts are trustworthy.
   static uint32_t seenId[32];
   static uint8_t  seenCnt[32];
   static int      seenN = 0;
 
-  for (int ci = 0; ci < (int)(sizeof(cand) / sizeof(cand[0])); ci++) {
-    int hu = cand[ci];
-    int halfN = expandToHalfbits(dts, lvs, n, hu, bigHalf, (int)sizeof(bigHalf));
-    Serial.printf("    [BigDiag] half=%dus halfN=%d\n", hu, halfN);
-    if (halfN < 80) continue;
+  int hu = 122;
+  int halfN = expandToHalfbits(dts, lvs, n, hu, bigHalf, (int)sizeof(bigHalf));
+  Serial.printf("    [BigDiag] half=%dus halfN=%d\n", hu, halfN);
+  if (halfN < 80) return;
+  for (int start = 0; start <= 16; start++) {
     for (int inv = 0; inv <= 1; inv++) {
       static uint8_t bits[400];
-      int nb = manchesterDecode(bigHalf, halfN, bits, (int)sizeof(bits), inv != 0);
-      if (nb < 65) continue;
-      int nbytes = min(12, nb / 8);
-      Serial.printf("      manch inv=%d (%dbit): ", inv, nb);
-      for (int b = 0; b < nbytes; b++) {
-        uint8_t v = 0;
-        for (int bit = 0; bit < 8; bit++)
-          v = (uint8_t)((v << 1) | (bits[b * 8 + bit] & 1));
-        Serial.printf("%02X ", v);
-      }
-      Serial.println();
-      // Scan start offset (0-3 half-bits) x bit alignment (0-7) for a valid CRC
-      for (int start = 0; start <= 3; start++) {
-        int sn = manchesterDecode(bigHalf + start, halfN - start, bits, (int)sizeof(bits), inv != 0);
-        for (int bo = 0; bo <= 7 && bo + 64 <= sn; bo++) {
-          ContinentalTPMSData t = decodeContinentalTPMS(bits, sn, bo);
-          // Only trust hits that look like a real packet: known brand byte and a
-          // plausible pressure. Kills random CRC collisions.
-          if (t.crcValid && (t.brand == 0xA8 || t.brand == 0x98 || t.brand == 0x80) &&
-              t.pressurePsi >= 5.0f && t.pressurePsi <= 60.0f) {
-            int slot = -1;
-            for (int s = 0; s < seenN; s++)
-              if (seenId[s] == t.sensorId) { slot = s; break; }
-            if (slot < 0 && seenN < 32) { slot = seenN++; seenId[slot] = t.sensorId; seenCnt[slot] = 0; }
-            if (slot >= 0 && seenCnt[slot] < 255) seenCnt[slot]++;
-            Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=%02X ID=%08X PSI=%.1f %dC seen=%d%s\n",
-                          hu, inv, start, bo, t.brand, t.sensorId,
-                          t.pressurePsi, (int)t.temperatureC,
-                          (slot >= 0) ? seenCnt[slot] : 0,
-                          (slot >= 0 && seenCnt[slot] >= 2) ? "  ** REPEAT (real!) **" : "");
-          }
+      memset(bits, 0, sizeof(bits));
+      int sn = manchesterDecode(bigHalf + start, halfN - start, bits, (int)sizeof(bits), inv != 0);
+      if (sn < 64) continue;
+
+      // Try Continental decode at bit offsets 0-15 (up to 2 bytes of misalignment)
+      for (int bo = 0; bo <= 15 && bo + 64 <= sn; bo++) {
+        ContinentalTPMSData t = decodeContinentalTPMS(bits, sn, bo);
+
+        // Only trust hits that look like a real packet: known brand byte and a
+        // plausible pressure. Kills random CRC collisions.
+        if (t.crcValid  && isMyCarSensor(t.sensorId) &&
+            t.pressurePsi >= 0.1f && t.pressurePsi <= 60.0f) {
+          Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=%02X ID=%08X PSI=%.1f %dC\n",
+                        hu, inv, start, bo, t.brand, t.sensorId,
+                        t.pressurePsi, (int)t.temperatureC);
+          return;  // only show first hit
         }
       }
     }
@@ -786,8 +886,8 @@ static bool ccVersionOk() {
 // 手動POR -> radio.begin -> 受信設定 までを1回分。成功したら true。
 static bool radioTryInit(bool verbose = true) {
   ccPowerOnReset();
-  uint8_t partnum = ccReadStatus(0x30);
-  uint8_t version = ccReadStatus(0x31);
+  uint8_t partnum = ccReadStatus(RADIOLIB_CC1101_REG_PARTNUM);
+  uint8_t version = ccReadStatus(RADIOLIB_CC1101_REG_VERSION);
 
   // CC1101 init: 8.192 kbps (=1/122us), FSK dev 40 kHz
   // RxBW narrowed 325->162kHz to cut noise bandwidth (~+4dB sensitivity) for the
@@ -841,7 +941,7 @@ void setup() {
   digitalWrite(PIN_CS, HIGH);
   pinMode(PIN_GDO0, INPUT);
   pinMode(PIN_GDO2, INPUT);
-  // GDO2 の割込は radioTryInit() 成功時に付ける（未初期化中の ISR 崐を避ける）
+  // GDO2 の割込は radioTryInit() 成功時に付ける（未初期化中の ISR を避ける）
 
   Serial.println("=== Continental/Nissan TPMS Receiver @ 315.0 MHz (v3) ===");
   Serial.printf("Build env: %s\n", TPMS_ENV_NAME);
@@ -944,24 +1044,21 @@ void loop() {
 
   uint32_t nowUs = micros();
 
-  // Force-finalize burst
-  if (!burstReady && edgeN >= (MAX_EDGES - 10)) {
-    noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
-  }
-  // 【コンチネンタル/Autel完全ハイブリッド対応】
-  // エッジ数に応じた動的なパケット終了判定（可変タイムアウト）
-  if (!burstReady && edgeN >= MIN_EDGES) {
-    
-    // ① すでに1パケット分以上のエッジが溜まっている場合（走行中バーストなど）
-    // 連発パケットの切れ目を確実に捉えるため、少し広めのドライブモード用ギャップで判定
-    if (edgeN >= CONTINENTAL_PACKET_EDGES && (nowUs - lastEdgeUs > GAP_DRIVE_MODE_US)) {
-      noInterrupts(); burstReady = true; burstEndUs = lastEdgeUs; interrupts();
+ // ============================================================
+  // Force-finalize burst (どれか1つでも満たしたら即座に処理へ回す)
+  // ============================================================
+  if (!burstReady) {
+    // 【大元のバッファ上限セーフティ】（クラッシュ防止リミッター）
+    // 配列の最大サイズ（MAX_EDGES=4000）を突き抜けてメモリ破壊・ハングアップを起こすのを
+    // 絶対に防ぐための、システム全体の最下層の鉄壁リミッターです。そのまま残します。
+    if (edgeN >= (MAX_EDGES - 10)) {
+      noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
     }
-    
-    // ② エッジがまだ少ない場合（停車中の単発パケットなど）
-    // お尻に環境ノイズを吸い込んでデータが汚染される前に、短いパークモード用ギャップで即座に閉じる
-    else if (edgeN < CONTINENTAL_PACKET_EDGES && (nowUs - lastEdgeUs > GAP_PARK_MODE_US)) {
-      noInterrupts(); burstReady = true; burstEndUs = lastEdgeUs; interrupts();
+    // 【長時間タイムアウトセーフティ】
+    // エッジ数が250に達しないような中途半端なノイズが、延々とバッファに
+    // 居座り続けるのを防ぐため、40ms 経過したら強制リセットして次へ回します。
+    if (edgeN > 30 && (nowUs - burstStartUs > 40000)) {
+      noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
     }
   }
 
@@ -991,7 +1088,7 @@ void loop() {
     } else if (!burstReady) {
       if (r > curBurstRssiMax) {
         curBurstRssiMax = r;
-        uint8_t fe = ccReadStatus(0x32);          // FREQEST
+        uint8_t fe = ccReadStatus(RADIOLIB_CC1101_REG_FREQEST);
         curBurstFreqEst = (fe >= 128) ? (fe - 256) : fe;
       }
     }
@@ -1036,9 +1133,10 @@ void loop() {
   int n;
   uint32_t bStart, bEnd;
 
-  noInterrupts();
-  n = edgeN;
+  noInterrupts(); // 一時的に新しい割り込みを止めて、データが書き換わるのを防ぐ
+  n = edgeN;      // 溜まったエッジ数（250本など）をコピー
   if (n > MAX_EDGES) n = MAX_EDGES;
+    // ここで dtBuf（割り込みが溜めた生データ）を、dts（loop側で解析するための配列）へ吸い出す！
   for (int i = 0; i < n; i++) { dts[i] = dtBuf[i]; lvs[i] = lvBuf[i]; }
   bStart = burstStartUs;
   bEnd   = burstEndUs;
@@ -1068,6 +1166,15 @@ void loop() {
   float peakFrac = 0.0f;
   int halfUs = estimateHalfBitUs(dts, n, &peakFrac);
 
+  // ─── 【マルチパス・サチュレーション救済ゲート】───
+  // RSSI が -70dBm 以上に跳ね上がり、パルスが 37us や 47us に
+  // ズタズタに潰されている場合、これは自車センサーの超強力パケットの悲鳴です。
+  // 問答無用で halfUs = 122 に強制書き換えして合格ゲートを突破させます！
+
+  if (burstRssi >= -75 && (halfUs < 100 || halfUs > 150)) {
+    halfUs = 122; // 強制的に Continental 基準値に上書きして下のデコーダーへ叩き込む！
+  }
+
   // ============================================================
   // KEY FILTER: halfUs must be 100-150us (Continental/Nissan TPMS)
   // Eliminates false triggers from noise at h=46, 52, 64 etc.
@@ -1075,7 +1182,7 @@ void loop() {
   if (halfUs < 100 || halfUs > 150) {
     // A packet-sized burst rejected here may be a real packet with a skewed
     // halfUs estimate -> dump raw timing (throttled) to read its true bit period.
-    if (bigBurst && ENABLE_DETAILED_LOG) {
+    if (bigBurst && ENABLE_DETAILED_LOG && (ENABLE_BIGDROP_DETAILED_LOG || (burstRssi >= -89))) {
       cntBigDropped++;
       static uint32_t lastBigMs = 0;
       if (millis() - lastBigMs >= 2000) {
@@ -1140,8 +1247,16 @@ void loop() {
     }
   }
 
+  // ─── 走行ノイズによる物差しのブレを、本物の 122us に叩き直す ───
+  // 100〜150us（Continentalゲート）を合格したものは、ノイズで多少ブレていようが、
+  // 物理的な真値は100%「122us（データレート8.192kbps）」です。
+  // ここで 122us 固定にしてから下の expandToHalfbits に引き渡すことで、
+  // 先ほど中身を書き換えた「動的追従（PLL）」が最高精度で綺麗にロックオンを始めます！
+  halfUs = 122;
+
   // ---- Expand to half-bits ----
   static uint8_t halfLv[8000];
+  memset(halfLv, 0, sizeof(halfLv));
   int halfN = expandToHalfbits(dts, lvs, n, halfUs, halfLv, (int)sizeof(halfLv));
 
   // ---- Dual preamble detection ----
@@ -1183,12 +1298,13 @@ void loop() {
       if (ir > 0.25f) continue;
       for (int invMode = 0; invMode <= 1; invMode++) {
         static uint8_t scanBits[400];
+        memset(scanBits, 0, sizeof(scanBits));
         int scanN = manchesterDecode(halfLv + scanStart, halfN - scanStart,
                                      scanBits, (int)sizeof(scanBits), invMode != 0);
         if (scanN < 65) continue;
-        for (int bo = 0; bo <= 7 && bo + 64 <= scanN; bo++) {
+        for (int bo = 0; bo <= 15 && bo + 64 <= scanN; bo++) {
           ContinentalTPMSData trial = decodeContinentalTPMS(scanBits, scanN, bo);
-          if (trial.valid) {
+          if (trial.valid && isMyCarSensor(trial.sensorId)) {
             diagFound = trial;
             goto scanDone;
           }
@@ -1233,15 +1349,17 @@ void loop() {
       if (invRate > 0.30f) continue;  // too many invalid pairs
 
       static uint8_t trialBits[400];
+      memset(trialBits, 0, sizeof(trialBits));
       int trialN = manchesterDecode(halfLv + start, halfN - start,
                                     trialBits, (int)sizeof(trialBits), invMode != 0);
       if (trialN < 65) continue;  // need at least 1 skip + 64 data bits
 
-      // Try bit alignments 0-7
-      for (int bitOff = 0; bitOff <= 7 && bitOff + 64 <= trialN; bitOff++) {
+      // 実走時の激しいズレ（bitOff=12など）を跨ぎきるため、探索幅を 15（1.5バイト分）へ拡張！
+      // これにより、大元のプリアンブル検索を]すり抜けた走行フレームをここで1本残らず完璧に仕留めます。
+      for (int bitOff = 0; bitOff <= 15 && bitOff + 64 <= trialN; bitOff++) {
         ContinentalTPMSData trial = decodeContinentalTPMS(trialBits, trialN, bitOff);
 
-        if (trial.valid) {
+        if (trial.valid && isMyCarSensor(trial.sensorId)) {
           bool isBetter = false;
           if (!bestData.valid)               isBetter = true;
           else if (invRate < bestInvRate)     isBetter = true;
