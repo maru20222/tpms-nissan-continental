@@ -27,6 +27,8 @@
 #include <SPI.h>
 #include <driver/gpio.h>
 #include <RadioLib.h>
+#include <Preferences.h>
+#include <math.h>
 #include "lcd_display.h"
 
 // ====== Build environment: dev / prod ======
@@ -56,7 +58,21 @@ static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
 #endif
 
 // ====== receive wait time (ms) ======
+// 詳細ログOFF時のみ使う、受信後のクールダウン上限。
+// 強い信号ほど短くして、次のバースト取りこぼしを減らす。
 static const int RECEIVE_WAIT_TIME_MS = 50;
+
+static int calcReceiveWaitMs(int burstRssi) {
+  if (ENABLE_DETAILED_LOG) return 0;
+
+  // 強電界では短く、弱電界では少し長めに待つ。
+  // 50ms 固定より、車内で強いTPMS信号を続けて拾いやすい。
+  if (burstRssi >= -75) return 0;
+  if (burstRssi >= -80) return 5;
+  if (burstRssi >= -85) return 10;
+  if (burstRssi >= -90) return 20;
+  return RECEIVE_WAIT_TIME_MS;
+}
 
 // ====== Pin wiring ======
 static const int PIN_CS   = 10;
@@ -91,6 +107,206 @@ static const KnownSensor KNOWN_SENSORS[] = {
 };
 #endif
 static const int KNOWN_SENSOR_COUNT = (int)(sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]));
+
+// ====== Persistent LCD state (NVS) ======
+static const uint32_t TPMS_STATE_MAGIC = 0x54504D53;  // 'TPMS'
+static const uint16_t TPMS_STATE_VERSION = 1;
+static const uint32_t TPMS_STATE_SAVE_INTERVAL_MS = 60000;
+
+struct PersistTireSlot {
+  uint32_t sensorId;
+  float    psi;
+  float    bar;
+  float    kPa;
+  float    temperatureC;
+  uint8_t  valid;
+  uint8_t  reserved[3];
+};
+
+struct PersistDisplayState {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t  envDev;
+  uint8_t  slotCount;
+  uint32_t sensorTableHash;
+  uint32_t savedAtSec;
+  PersistTireSlot slots[LCD_SENSOR_COUNT];
+  uint32_t checksum;
+};
+
+static PersistDisplayState g_lastSavedState = {};
+static bool g_hasLastSavedState = false;
+static bool g_displayStateDirty = false;
+static uint32_t g_lastPersistAttemptMs = 0;
+
+static uint32_t fnv1a32(const uint8_t* data, size_t len) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    h ^= data[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static uint32_t calcKnownSensorsFingerprint() {
+  uint32_t h = 2166136261u;
+  for (int i = 0; i < KNOWN_SENSOR_COUNT; i++) {
+    h ^= KNOWN_SENSORS[i].fullId; h *= 16777619u;
+    h ^= (uint32_t)(KNOWN_SENSORS[i].lcdSlot & 0xFF); h *= 16777619u;
+  }
+  h ^= (uint32_t)KNOWN_SENSOR_COUNT; h *= 16777619u;
+  return h;
+}
+
+static const char* getStateNamespace() {
+  return TPMS_ENV_DEV ? "tpms_dev" : "tpms_prod";
+}
+
+static bool sameSlotForSave(const PersistTireSlot& a, const PersistTireSlot& b) {
+  if (a.valid != b.valid) return false;
+  if (!a.valid) return true;
+  if (a.sensorId != b.sensorId) return false;
+  if (fabsf(a.psi - b.psi) > 0.05f) return false;
+  if (fabsf(a.bar - b.bar) > 0.01f) return false;
+  if (fabsf(a.kPa - b.kPa) > 0.5f) return false;
+  if (fabsf(a.temperatureC - b.temperatureC) > 0.5f) return false;
+  return true;
+}
+
+static bool sameStateForSave(const PersistDisplayState& a, const PersistDisplayState& b) {
+  if (a.magic != b.magic || a.version != b.version ||
+      a.envDev != b.envDev || a.slotCount != b.slotCount ||
+      a.sensorTableHash != b.sensorTableHash) {
+    return false;
+  }
+  for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
+    if (!sameSlotForSave(a.slots[i], b.slots[i])) return false;
+  }
+  return true;
+}
+
+static void buildStateFromRam(PersistDisplayState* out) {
+  memset(out, 0, sizeof(*out));
+  out->magic = TPMS_STATE_MAGIC;
+  out->version = TPMS_STATE_VERSION;
+  out->envDev = TPMS_ENV_DEV ? 1 : 0;
+  out->slotCount = LCD_SENSOR_COUNT;
+  out->sensorTableHash = calcKnownSensorsFingerprint();
+  out->savedAtSec = millis() / 1000;
+
+  for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
+    out->slots[i].sensorId = g_tireState[i].sensorId;
+    out->slots[i].psi = g_tireState[i].psi;
+    out->slots[i].bar = g_tireState[i].bar;
+    out->slots[i].kPa = g_tireState[i].kPa;
+    out->slots[i].temperatureC = g_tireState[i].temperatureC;
+    out->slots[i].valid = g_tireState[i].valid ? 1 : 0;
+  }
+
+  out->checksum = fnv1a32((const uint8_t*)out, sizeof(*out) - sizeof(out->checksum));
+}
+
+static bool isStateHeaderValid(const PersistDisplayState& s) {
+  if (s.magic != TPMS_STATE_MAGIC) return false;
+  if (s.version != TPMS_STATE_VERSION) return false;
+  if (s.envDev != (TPMS_ENV_DEV ? 1 : 0)) return false;
+  if (s.slotCount != LCD_SENSOR_COUNT) return false;
+  if (s.sensorTableHash != calcKnownSensorsFingerprint()) return false;
+  uint32_t calc = fnv1a32((const uint8_t*)&s, sizeof(s) - sizeof(s.checksum));
+  if (calc != s.checksum) return false;
+  return true;
+}
+
+static void restoreDisplayStateFromPersist(const PersistDisplayState& s) {
+  static const uint32_t RESTORE_DISPLAY_AGE_MS = 999000UL;
+  int restored = 0;
+  for (int i = 0; i < LCD_SENSOR_COUNT; i++) {
+    if (!s.slots[i].valid) continue;
+    lcdUpdateTire(i,
+                  s.slots[i].sensorId,
+                  s.slots[i].psi,
+                  s.slots[i].bar,
+                  s.slots[i].kPa,
+                  s.slots[i].temperatureC);
+    // 復帰直後は「保存データを読み出しただけ」で、最新受信ではないことを
+    // ひと目で分かるように 999s 表示へ寄せる。
+    // uint32_t の差分演算なので、millis() ベースでも問題なく扱える。
+    g_tireState[i].lastUpdateMs = millis() - RESTORE_DISPLAY_AGE_MS;
+    restored++;
+  }
+  Serial.printf("[PERSIST] Restored %d tire slots from NVS (%s)\n", restored, getStateNamespace());
+}
+
+static void loadPersistedDisplayState() {
+  Preferences prefs;
+  if (!prefs.begin(getStateNamespace(), true)) {
+    Serial.printf("[PERSIST] open(read) failed: ns=%s\n", getStateNamespace());
+    return;
+  }
+
+  size_t len = prefs.getBytesLength("lcd_state");
+  if (len != sizeof(PersistDisplayState)) {
+    if (len > 0) {
+      Serial.printf("[PERSIST] size mismatch: stored=%u expected=%u\n",
+                    (unsigned)len, (unsigned)sizeof(PersistDisplayState));
+    }
+    prefs.end();
+    return;
+  }
+
+  PersistDisplayState loaded = {};
+  size_t rd = prefs.getBytes("lcd_state", &loaded, sizeof(loaded));
+  prefs.end();
+  if (rd != sizeof(loaded)) {
+    Serial.printf("[PERSIST] read failed: %u/%u\n", (unsigned)rd, (unsigned)sizeof(loaded));
+    return;
+  }
+  if (!isStateHeaderValid(loaded)) {
+    Serial.println("[PERSIST] ignored: header/checksum/env/sensor-table mismatch");
+    return;
+  }
+
+  restoreDisplayStateFromPersist(loaded);
+  g_lastSavedState = loaded;
+  g_hasLastSavedState = true;
+  g_displayStateDirty = false;
+}
+
+static void maybeSavePersistedDisplayState(bool force = false) {
+  uint32_t now = millis();
+  if (!force) {
+    if (!g_displayStateDirty) return;
+    if ((uint32_t)(now - g_lastPersistAttemptMs) < TPMS_STATE_SAVE_INTERVAL_MS) return;
+  }
+
+  PersistDisplayState cur = {};
+  buildStateFromRam(&cur);
+  if (g_hasLastSavedState && sameStateForSave(cur, g_lastSavedState)) {
+    g_displayStateDirty = false;
+    g_lastPersistAttemptMs = now;
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(getStateNamespace(), false)) {
+    Serial.printf("[PERSIST] open(write) failed: ns=%s\n", getStateNamespace());
+    g_lastPersistAttemptMs = now;
+    return;
+  }
+
+  size_t wr = prefs.putBytes("lcd_state", &cur, sizeof(cur));
+  prefs.end();
+  g_lastPersistAttemptMs = now;
+
+  if (wr == sizeof(cur)) {
+    g_lastSavedState = cur;
+    g_hasLastSavedState = true;
+    g_displayStateDirty = false;
+    Serial.printf("[PERSIST] saved (%s)\n", getStateNamespace());
+  } else {
+    Serial.printf("[PERSIST] write failed: %u/%u\n", (unsigned)wr, (unsigned)sizeof(cur));
+  }
+}
 
 // 【自車センサーID完全一致チェック関数】
 bool isMyCarSensor(uint32_t sensorId) {
@@ -949,7 +1165,8 @@ void setup() {
   Serial.println("Format: Brand(8)+ID(32)+Press(8)+Temp(8)+CRC8(8) = 64bit");
 
   // RF が死んでいても画面は出したいので LCD を先に立ち上げる
-    lcdBegin();
+  lcdBegin();
+  loadPersistedDisplayState();
 
   // 車載(ダッシュボード)では電源の立ち上がりが遅く初回が -2 になる。
   // 電源が安定するまで間隔を空けて粘る。ここで諦めても再起動はしない。
@@ -980,6 +1197,9 @@ void setup() {
 
 // ====== loop() ======
 void loop() {
+  // 変更があれば1分周期でNVSへ書き戻す（dev/prodはnamespace分離）。
+  maybeSavePersistedDisplayState(false);
+
   // CC1101 が未初期化なら再起動せずに再試行し続ける（電源が安定すれば復帰する）
   if (!g_radioReady) {
     static uint32_t lastTryMs = 0;
@@ -1215,7 +1435,6 @@ void loop() {
         diagBigBurst(dts, lvs, n, dur / 1000);
       }
     }
-    if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
     radio.startReceive();
     return;
   }
@@ -1230,7 +1449,6 @@ void loop() {
                       n, (unsigned long)(dur / 1000), halfUs, peakFrac);
       }
     }
-    if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
     radio.startReceive();
     return;
   }
@@ -1323,8 +1541,6 @@ void loop() {
     if(ENABLE_DETAILED_LOG) {
       Serial.printf("  [NoData] halfN=%d decodeStart=%d remaining=%d (need ~130 half-bits for 64-bit Continental)\n",
                     halfN, decodeStart, remaining);
-    } else {
-      delay(RECEIVE_WAIT_TIME_MS);
     }
     
     cntPreamble++;
@@ -1397,7 +1613,7 @@ void loop() {
           Serial.printf("  [DecodeFail] No valid CRC-8 match found (halfUs=%d)\n", halfUs);
         }
       }
-      if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
+      delay(calcReceiveWaitMs(burstRssi));
       radio.startReceive();
       return;
     }
@@ -1426,11 +1642,12 @@ void loop() {
 
   // ---- LCD update (CRC verified = trusted) ----
   int lcdSlot = sensorRecords[recIdx].lcdSlot;
-  if (lcdSlot >= 0 && lcdSlot < LCD_SENSOR_COUNT)
+  if (lcdSlot >= 0 && lcdSlot < LCD_SENSOR_COUNT) {
     lcdUpdateTire(lcdSlot, bestData.sensorId,
                   bestData.pressurePsi, bestData.pressureBar,
                   bestData.pressureKpa, bestData.temperatureC);
-  if(!ENABLE_DETAILED_LOG){delay(RECEIVE_WAIT_TIME_MS);}
+    g_displayStateDirty = true;
+  }
   radio.startReceive();
 
   if (millis() - lastKickMs > 3000) {
