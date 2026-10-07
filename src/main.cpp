@@ -12,7 +12,7 @@
 //
 // Protocol (reverse-engineered from captures + BMW Gen5 reference):
 //   Modulation  : FSK, Manchester coded (G.E. Thomas)
-//   Half-bit    : ~122us  (Continental short=122)
+//   Half-bit    : 122us (park mode) / ~52us measured (drive mode, nominal 61us)
 //   Preamble    : Alternating 0/1 run (~28+ half-bits)
 //   Data (8 bytes = 64 bits, at bit offset 1 from Manchester decode):
 //     Byte 0     : Brand/Manufacturer (8h)  -- 0xA8 for this sensor
@@ -53,26 +53,9 @@ static const char* const TPMS_ENV_NAME = "PROD (Autel MX-Sensor)";
 #define ENABLE_DETAILED_LOG false
 #endif
 
-#ifndef ENABLE_BIGDROP_DETAILED_LOG
-#define ENABLE_BIGDROP_DETAILED_LOG false
+#ifndef ENABLE_OTHER_SENSOR_ID_LOG
+#define ENABLE_OTHER_SENSOR_ID_LOG false
 #endif
-
-// ====== receive wait time (ms) ======
-// 詳細ログOFF時のみ使う、受信後のクールダウン上限。
-// 強い信号ほど短くして、次のバースト取りこぼしを減らす。
-static const int RECEIVE_WAIT_TIME_MS = 50;
-
-static int calcReceiveWaitMs(int burstRssi) {
-  if (ENABLE_DETAILED_LOG) return 0;
-
-  // 強電界では短く、弱電界では少し長めに待つ。
-  // 50ms 固定より、車内で強いTPMS信号を続けて拾いやすい。
-  if (burstRssi >= -75) return 0;
-  if (burstRssi >= -80) return 5;
-  if (burstRssi >= -85) return 10;
-  if (burstRssi >= -90) return 20;
-  return RECEIVE_WAIT_TIME_MS;
-}
 
 // ====== Pin wiring ======
 static const int PIN_CS   = 10;
@@ -546,51 +529,30 @@ void ccEnableAsyncOnGDO2() {
                 ccRead(RADIOLIB_CC1101_REG_AGCCTRL2), ccRead(RADIOLIB_CC1101_REG_AGCCTRL1), ccRead(RADIOLIB_CC1101_REG_AGCCTRL0));
 }
 
-// ====== Burst capture (ISR) ======
-static const int MAX_EDGES = 4000;
-static const int MIN_EDGES = 40;
+// ====== Edge capture (ISR -> ring buffer) ======
+// GDO2 の全エッジを止めずにリングバッファへ記録し続ける。
+// 非同期モードでは常時ノイズエッジが出ているため、エッジ数で締め切る方式では
+// パケットが窓の境界で分断されたり、解析中に取りこぼしたりする。
+// 解析は loop() 側で「前の窓と重なりを持たせた窓」を切り出して行うので、
+// 境界をまたいだパケットもどこかの窓には必ず丸ごと入る。
+static const uint32_t EDGE_RING_SIZE = 8192;   // 2の冪（ノイズ環境で約200ms分）
+static const uint32_t EDGE_RING_MASK = EDGE_RING_SIZE - 1;
+static volatile uint32_t edgeTimeBuf[EDGE_RING_SIZE];  // エッジ時刻 (micros)
+static volatile uint8_t  edgeLvBuf[EDGE_RING_SIZE];    // エッジ直後の GDO2 レベル
+static volatile uint32_t edgeWr = 0;                   // 累積エッジ数（書込み位置）
+static uint32_t g_procEnd = 0;                         // loop が解析済みの累積エッジ位置
 
-volatile uint16_t dtBuf[MAX_EDGES];
-volatile uint8_t  lvBuf[MAX_EDGES];
-volatile int edgeN = 0;
-volatile uint32_t lastEdgeUs = 0;
-volatile uint32_t burstStartUs = 0;
-volatile uint32_t burstEndUs = 0;
-volatile bool burstReady = false;
+static const int WIN_EDGES   = 1024;   // 1回の解析窓（エッジ数）
+static const int WIN_OVERLAP = 400;    // 前窓との重なり（1パケット≒100〜200エッジより長く）
+static const int WIN_STEP    = WIN_EDGES - WIN_OVERLAP;
+static const uint32_t WIN_MAX_LATENCY_US = 30000;  // エッジが少ない時も30ms毎に解析
 
 void IRAM_ATTR isrGdo2() {
-  // 【セーフティガード】すでにloop()側のデコード処理が完了していない（前回のデータを処理中）なら、
-  // 新しいエッジがきてもバッファを上書きしないよう、即座に何もしないでリターンする。
-  if (burstReady) return;
   uint32_t now = micros();
-  uint32_t dt = now - lastEdgeUs;
-  lastEdgeUs = now;
-
-  // グリッチノイズ（dtが0〜10usの範囲）を吸い込まないようにするため、ここで即座にリターンする。
-  if (dt > 0 && dt < 10) return; 
-
-  // バースト（パケット）の一番最初のエッジが届いた瞬間、その時刻を記録しておく。
-  if (edgeN == 0) burstStartUs = now;
-
-  // 250エッジを超えたら、即座に loop() 側に引き渡す（バッファ汚染を防ぐ）
-  if (edgeN >= 250) {
-    burstEndUs = now - dt;
-    burstReady = true; // 250本で「1パケット完成」として即座に loop() に引き渡す
-    return;            // 251本目以降のノイズエッジは完全シャットアウト（バッファ汚染を防ぐ）
-  }
-
-  // =========================================================================
-  // 【データ格納エリア】最大4,000本までエッジを配列に保存し続ける
-  // =========================================================================
-  // 250本ガードがない状態だと、2.5msの隙間が空かない限り、ノイズを吸い込み続け、
-  // loop()側の古いセーフティ（576本付近）で無理やり止められるまで、配列にゴミを格納し続けていました。
-  if (edgeN < MAX_EDGES) {
-    // CC1101のタイマー仕様に合わせ、dtが65.5ms（uint16_tの上限）を超えた場合は飽和（カンスト）させる
-    dtBuf[edgeN] = (dt > 65535 ? 65535 : (uint16_t)dt);
-    // その瞬間のGDO2ピンのLo/Hi状態をそのまま保存する（マンチェスター復調用）
-    lvBuf[edgeN] = (uint8_t)digitalRead(PIN_GDO2);
-    edgeN++;
-  }
+  uint32_t w = edgeWr;
+  edgeTimeBuf[w & EDGE_RING_MASK] = now;
+  edgeLvBuf[w & EDGE_RING_MASK]   = (uint8_t)digitalRead(PIN_GDO2);
+  edgeWr = w + 1;
 }
 
 // ====== Signal processing ======
@@ -599,95 +561,83 @@ static inline int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-// Estimate half-bit period from dt histogram (5usウィンドウ・走行ジッター対応型)
-int estimateHalfBitUs(const uint16_t* dts, int n, float* peakFrac = nullptr) {
-  // 5us刻みのビンを用意 (0〜300us を 60個のビンで管理)
-  static uint16_t bins[61];
-  memset(bins, 0, sizeof(bins));
-  int validCnt = 0;
+// ====== Pulse analysis (dual chip-rate) ======
+// Continental/日産センサーは状態によってチップレートが変わる:
+//   停止中(パークモード)  :  8192 chip/s -> 半ビット 122us
+//   走行中(ドライブモード): 公称 16384 chip/s(61us) だが実測は半ビット≈52us (51.2〜52.4us)
+// ※「半ビット31us」と換算するとノイズ(平均dt≒28us)が合格し、CRC総当たりで偽ヒットを量産する。
+// 検出は中間の 56us で行い、実際の半ビット長はラン毎に実測(href)して追従する。
+// (href はデコードログに出るので、実車での真値確認に使える)
+static const int HALF_US_DRIVE = 56;   // 44.8〜70us をカバー
+static const int HALF_US_PARK  = 122;  // 97.6〜152us をカバー
 
-  for (int i = 0; i < n; i++) {
-    int dt = dts[i];
-    if (dt >= 8 && dt <= 300) {
-      int b = dt / 5;
-      if (b >= 0 && b < 61) { bins[b]++; validCnt++; }
-    }
+static const int MIN_RUN_PULSES = 60;   // 64bitマンチェスター ≒ 64〜128パルス
+static const int MAX_HALF       = 1600;
+
+struct Pulse {
+  uint32_t endUs;   // パルスが終わったエッジの時刻
+  uint16_t dur;     // パルス幅 [us]
+  uint8_t  lv;      // パルス中の GDO2 レベル
+};
+
+// エッジ列 -> パルス列
+// パルス i のレベル = 直前エッジ直後に ISR が読んだ値。
+// ただしパルスが極端に短い(ISR が読む前に次のエッジが来た可能性)ときは
+// 読み値を信用せず、直前パルスの反転(交互性)で補う。
+static int buildPulses(const uint32_t* t, const uint8_t* lv, int n, Pulse* out) {
+  int m = 0;
+  for (int i = 1; i < n; i++) {
+    uint32_t d = t[i] - t[i - 1];
+    uint8_t level = (d >= 12 || m == 0) ? lv[i - 1] : (uint8_t)(out[m - 1].lv ^ 1);
+    out[m].endUs = t[i];
+    out[m].dur   = (d > 65535u) ? (uint16_t)65535u : (uint16_t)d;
+    out[m].lv    = level;
+    m++;
   }
-
-  // 🌟【走行時対策】最もパルスが集中している「5us幅の山」を探す
-  int bestBin = 24; // デフォルトは 120us 付近 (24 * 5)
-  uint16_t bestCnt = 0;
-  
-  // 15us から 200us の範囲をスキャン
-  for (int b = 3; b <= 40; b++) {
-    // 自身のビンとその前後1つの計3ビン（計15us幅）の合計で評価する
-    // これにより、走行中に 60us, 61us, 62us にブレて分散したパルスを1つの「大きな山」として正しく捕捉できます
-    uint16_t sum = bins[b-1] + bins[b] + bins[b+1];
-    if (sum > bestCnt) { bestCnt = sum; bestBin = b; }
-  }
-
-  // 代表値（中央の値）を決定
-  int bestDt = bestBin * 5 + 2;
-
-  if (peakFrac) {
-    int inPeak = 0;
-    // 本物の Continental センサーの「1倍の山(61us)」と「2倍の山(122us)」
-    // この2つの本物のエリアだけにパルスがどれだけ集中しているかを「厳格に」評価します
-    // ノイズ（46usなど）に騙されて peakFrac が高得点を出すバグを根絶します
-    for (int i = 0; i < n; i++) {
-      int dt = dts[i];
-      // 61us付近（50〜72us）または 122us付近（105〜135us）
-      if ((dt >= 50 && dt <= 72) || (dt >= 105 && dt <= 135)) {
-        inPeak++;
-      }
-    }
-    *peakFrac = (validCnt > 0) ? (float)inPeak / validCnt : 0.0f;
-  }
-  
-  return bestDt;
+  return m;
 }
 
-// Expand edge timings to half-bit level array
-// 【走行時対策】固定の halfUs ではなく、変動する currentHalfUs を基準に何マス分か計算
-int expandToHalfbits(const uint16_t* dts, const uint8_t* lvs, int n,
-                     int halfUs, uint8_t* halfLv, int halfMax) {
-  int out = 0;
-  
-  // 引数で渡された基準値を初期値として、動的に長さを伸縮させる「動的な物差し」
-  float currentHalfUs = halfUs;
-  // 追従の感度（0.02 = パルス幅のズレを約2%ずつ次の基準にフィードバックする）
-  // 走行時の緩やかなパルスの伸び縮みにピッタリ吸い付きます
-  const float trackingRate = 0.02f;
-
+// スパイク(glitchUs 未満)を前後のパルスに吸収し、同レベル連続も結合する。
+// 例: 59L 16L 29H ... のような 14〜16us のヒゲで半ビット位相がずれるのを防ぐ。
+static int mergeGlitches(const Pulse* in, int n, int glitchUs, Pulse* out) {
+  int m = 0;
   for (int i = 0; i < n; i++) {
-    int dt = dts[i];
-    if (dt < 8) continue;
-    if (dt > 5000) break;
-    uint8_t prevLv = (uint8_t)(lvs[i] ^ 1);
-
-    // 【走行時対策】固定の halfUs ではなく、変動する currentHalfUs を基準に何マス分か計算
-    float estimatedK = (float)dt / currentHalfUs;
-    int k = clampi((int)(estimatedK + 0.5f), 1, 20); // 四捨五入
-
-    // ノイズでなければ、今回の実際のパルス幅から「物差しの長さ」を微修正（フィードバック）
-    // 1パルスあたりのハーフビット数が多すぎる（ノイズや長い無通信）場合は追従をスキップ
-    if (k >= 1 && k <= 4) {
-      float actualHalfUs = (float)dt / k;
-      currentHalfUs = currentHalfUs + (actualHalfUs - currentHalfUs) * trackingRate;
-      
-      // ガード：引数で指定された本来の速度（30, 61, 122us）から±30%以上は離れないように縛る
-      // これにより、激しいノイズを吸い込んでも物差しが明当違いな値に壊れるのを防ぎます
-      float minBound = halfUs * 0.85f;
-      float maxBound = halfUs * 1.15f;
-      if (currentHalfUs < minBound) currentHalfUs = minBound;
-      if (currentHalfUs > maxBound) currentHalfUs = maxBound;
+    const Pulse& p = in[i];
+    if (m > 0 && (p.dur < glitchUs || p.lv == out[m - 1].lv)) {
+      uint32_t d = (uint32_t)out[m - 1].dur + p.dur;
+      out[m - 1].dur   = (d > 65535u) ? (uint16_t)65535u : (uint16_t)d;
+      out[m - 1].endUs = p.endUs;
+      continue;
     }
-
-    // ハーフビット配列への展開（外側のロジックと完全に同一）
-    for (int j = 0; j < k && out < halfMax; j++)
-      halfLv[out++] = prevLv;
+    out[m++] = p;
   }
-  return out;
+  return m;
+}
+
+// パルスが半ビット h のマンチェスター信号として妥当か判定する。
+// 単独パルス幅はスライサの H/L 非対称(例: 30H 75L)で大きく崩れるが、
+// 隣り合う2パルスの和は非対称が打ち消し合うので 2h〜4h(プリアンブルで〜5h)に収まる。
+// ノイズ(平均28us程度)はこの条件を連続で満たせないので、長い連続区間=パケット候補。
+// 単独パルスの下限(0.4h)はノイズ除けの要。下げるとノイズだけでランが立ち始める。
+static void markGood(const Pulse* p, int n, int h, uint8_t* good) {
+  const uint32_t pulseMin = (uint32_t)h * 4 / 10;
+  const uint32_t pulseMax = (uint32_t)h * 46 / 10;
+  const uint32_t pairMin  = (uint32_t)h * 16 / 10;
+  const uint32_t pairMax  = (uint32_t)h * 66 / 10;
+  for (int i = 0; i < n; i++) {
+    good[i] = 0;
+    if (p[i].dur < pulseMin || p[i].dur > pulseMax) continue;
+    bool ok = false;
+    if (i + 1 < n) {
+      uint32_t s = (uint32_t)p[i].dur + p[i + 1].dur;
+      ok = (s >= pairMin && s <= pairMax);
+    }
+    if (!ok && i > 0) {
+      uint32_t s = (uint32_t)p[i - 1].dur + p[i].dur;
+      ok = (s >= pairMin && s <= pairMax);
+    }
+    good[i] = ok ? 1 : 0;
+  }
 }
 
 // Manchester decode (G.E. Thomas: invert=false -> 01=0, 10=1)
@@ -762,25 +712,6 @@ int findNissanPreamble(const uint8_t* halfLv, int halfN, bool* out_inverted,
   return bestPos;
 }
 
-// Find longest alternating-bit run (01 or 10 repeating)
-int findAlternatingRun(const uint8_t* halfLv, int halfN, int* out_pos, int* out_endPos) {
-  int bestRun = 0, bestPos = 0;
-  int i = 0;
-  while (i < halfN - 1) {
-    int start = i;
-    int runLen = 0;
-    while (i + 1 < halfN && halfLv[i] != halfLv[i + 1]) {
-      runLen++; i++;
-    }
-    if (runLen > 0) runLen++;
-    if (runLen > bestRun) { bestRun = runLen; bestPos = start; }
-    i++;
-  }
-  if (out_pos) *out_pos = bestPos;
-  if (out_endPos) *out_endPos = bestPos + bestRun;
-  return bestRun;
-}
-
 // ====== CRC-8 (poly=0x07, init=0xAA) ======
 static uint8_t crc8(const uint8_t* data, int len) {
   uint8_t crc = 0xAA;
@@ -816,6 +747,8 @@ struct ContinentalTPMSData {
   bool     pressureAlert;   // brand bit5: 0=alert, 1=normal
   bool     batteryLow;      // extra bit7: 1=low battery (tentative)
   uint8_t  sequence;        // extra bit5-0: 6-bit sequence counter
+  bool     driveFormat;     // true: 走行モード9バイト形式 (byte7=フラグ, byte8=CRC)
+  uint8_t  driveFlags;      // 走行モードの byte7（01/02/04 と変化。送信リピート番号?）
 };
 
 // Decode Continental TPMS from Manchester decoded bits, starting at bitOffset
@@ -852,7 +785,19 @@ ContinentalTPMSData decodeContinentalTPMS(const uint8_t* bits, int nBits, int bi
   d.crcComputed    = crc8(pkt, 7);  // CRC over bytes 0-6
   d.crcValid       = (d.crcComputed == d.crcReceived);
 
-  if (maxBytes >= 9) {
+  // 走行モード(半ビット≈52us)は 9バイト形式:
+  //   Brand(8) + ID(32) + Press(8) + Temp(8) + Flags(8) + CRC-8(8)
+  //   CRC は停止中と同じ poly=0x07 init=0xAA で byte0-7 を対象。
+  //   実測例(RL): B9 AE58E836 01 4B {01,02,04} {F7,FE,EC}
+  if (!d.crcValid && maxBytes >= 9 && crc8(pkt, 8) == pkt[8]) {
+    d.crcValid    = true;
+    d.driveFormat = true;
+    d.driveFlags  = pkt[7];
+    d.crcReceived = pkt[8];
+    d.crcComputed = pkt[8];
+  }
+
+  if (maxBytes >= 9 && !d.driveFormat) {
     d.extraByte = pkt[8];
     d.hasExtra = true;
     d.batteryLow = (pkt[8] & 0x80) != 0;   // bit7: battery flag
@@ -938,152 +883,256 @@ int trackSensor(const ContinentalTPMSData& data) {
   return slot;
 }
 
-// ====== DIAG output ======
-// Returns valid ContinentalTPMSData if CRC match found during DIAG scan
-ContinentalTPMSData printDiag(const uint16_t* dts, const uint8_t* lvs, int n,
-               const uint8_t* halfLv, int halfN, int halfUs,
-               uint32_t durMs, float pf,
-               int preambleScore, bool isInv, int altRun, int altEnd,
-               int dataStart) {
-  ContinentalTPMSData diagResult = {};
-  
-  if(ENABLE_DETAILED_LOG)
-  {
-  Serial.printf("\n==== [DIAG] sc=%d/36 altRun=%d edges=%d dur=%lums halfUs=%d pf=%.2f halfN=%d inv=%d ====\n",
-                preambleScore, altRun, n, (unsigned long)durMs, halfUs, pf, halfN, (int)isInv);
-  }
-  // dt histogram
-  {
-    static uint16_t dtBins[61];
-    memset(dtBins, 0, sizeof(dtBins));
-    for (int i = 0; i < n; i++) {
-      int bin = dts[i] / 5;
-      if (bin >= 0 && bin < 61) dtBins[bin]++;
-    }
-    if(ENABLE_DETAILED_LOG) {Serial.printf("  dt-hist: ");}
-    for (int top = 0; top < 5; top++) {
-      int bestBin = -1; uint16_t bestCntB = 0;
-      for (int b = 0; b < 61; b++)
-        if (dtBins[b] > bestCntB) { bestCntB = dtBins[b]; bestBin = b; }
-      if (bestBin < 0 || bestCntB == 0) break;
-      if(ENABLE_DETAILED_LOG) {Serial.printf("%d-%dus(%d) ", bestBin * 5, bestBin * 5 + 4, bestCntB);}
-      dtBins[bestBin] = 0;
-    }
-    if(ENABLE_DETAILED_LOG) {Serial.println();}
-  }
+// ====== RSSI history ======
+// loop() で 2ms 毎に測った RSSI/FREQEST を時刻付きで保持し、
+// デコードできたパケットの時間帯のピーク値を後から引けるようにする。
+struct RssiSample {
+  uint32_t us;
+  int16_t  rssi;
+  int8_t   freqEst;
+};
+static const int RSSI_HIST = 128;   // 2ms x 128 = 約256ms
+static RssiSample g_rssiHist[RSSI_HIST];
+static int g_rssiHistWr = 0;
 
-  // Edge timings (first 30)
-  {
-    int showN = min(n, 30);
-    if(ENABLE_DETAILED_LOG) {Serial.printf("  edges[0..%d]: ", showN - 1);}
-    for (int i = 0; i < showN; i++)
-      if(ENABLE_DETAILED_LOG) {Serial.printf("%u%c ", dts[i], lvs[i] ? 'H' : 'L');}
-    if(ENABLE_DETAILED_LOG) {Serial.println();}
-  }
-
-  // Raw bytes at estimated halfUs and at 122us
-  {
-    static uint8_t tmpHalf[2000];
-    int rates[2] = { 122, 61 };
-    int rateCount = 2;
-    for (int r = 0; r < rateCount; r++) {
-      int rate = rates[r];
-      memset(tmpHalf, 0, sizeof(tmpHalf));
-      int tmpN = expandToHalfbits(dts, lvs, n, rate, tmpHalf, (int)sizeof(tmpHalf));
-      int maxBytes = min(20, tmpN / 8);
-      if (maxBytes < 2) continue;
-      if(ENABLE_DETAILED_LOG) {Serial.printf("  raw@%dus(N=%d): ", rate, tmpN);}
-      for (int b = 0; b < maxBytes; b++) {
-        uint8_t v = 0;
-        for (int bit = 0; bit < 8; bit++)
-          v = (uint8_t)((v << 1) | (tmpHalf[b * 8 + bit] & 1));
-        if(ENABLE_DETAILED_LOG) {Serial.printf("%02X ", v);}
-      }
-      if(ENABLE_DETAILED_LOG) {Serial.println();}
-    }
-  }
-
-  // Manchester decoded data + Continental alignment check
-  {
-    int dp = (dataStart >= 0) ? dataStart : altEnd;
-    if (dp >= 0 && dp < halfN - 4) {
-      int remaining = halfN - dp;
-      if(ENABLE_DETAILED_LOG) {Serial.printf("  data@%d (%d half-bits = %d manch-bits):\n", dp, remaining, remaining / 2);}
-      for (int inv = 0; inv <= 1; inv++) {
-        static uint8_t dbBits[400];
-        memset(dbBits, 0, sizeof(dbBits));
-        int dbN = manchesterDecode(halfLv + dp, remaining,
-                                   dbBits, (int)sizeof(dbBits), inv != 0);
-        if (dbN < 3) continue;
-        int dbBytes = min(15, (dbN + 7) / 8);
-        if(ENABLE_DETAILED_LOG) {Serial.printf("    manchester inv=%d (%dbit): ", inv, dbN);}
-        for (int b = 0; b < dbBytes; b++) {
-          uint8_t v = 0;
-          for (int bit = 0; bit < 8 && (b * 8 + bit) < dbN; bit++)
-            v = (uint8_t)((v << 1) | (dbBits[b * 8 + bit] & 1));
-          if(ENABLE_DETAILED_LOG) {Serial.printf("%02X ", v);}
-        }
-        if(ENABLE_DETAILED_LOG) {Serial.println();}
-
-        // Try Continental decode at bit offsets 0-15 (up to 2 bytes of misalignment)
-        for (int bo = 0; bo <= 15 && bo + 64 <= dbN; bo++) {
-          ContinentalTPMSData trial = decodeContinentalTPMS(dbBits, dbN, bo);
-          if (trial.crcValid) {
-            Serial.printf("    --> CRC OK @ bitOff=%d inv=%d: brand=%02X ID=%08X PSI=%.1f %dC\n",
-                          bo, inv, trial.brand, trial.sensorId,
-                          trial.pressurePsi, (int)trial.temperatureC);
-            if (trial.valid && !diagResult.valid)
-              diagResult = trial;
-          }
-        }
-      }
-    }
-  }
-
-  if(ENABLE_DETAILED_LOG) {Serial.println("====");}
-  return diagResult;
+static void pushRssiSample(uint32_t us, int rssi, int freqEst) {
+  g_rssiHist[g_rssiHistWr].us      = us;
+  g_rssiHist[g_rssiHistWr].rssi    = (int16_t)rssi;
+  g_rssiHist[g_rssiHistWr].freqEst = (int8_t)freqEst;
+  g_rssiHistWr = (g_rssiHistWr + 1) % RSSI_HIST;
 }
 
-// Diagnostic decode for packet-sized bursts that failed the halfUs filter.
-// Tries fixed half-bit candidates (independent of the broken estimate) and dumps
-// Manchester bytes + CRC scan, to identify the true bit period and confirm the
-// packet is decodable vs. front-end noise.
-void diagBigBurst(const uint16_t* dts, const uint8_t* lvs, int n, uint32_t durMs) {
-  static uint8_t bigHalf[8000];
-  memset(bigHalf, 0, sizeof(bigHalf));
-  // Cross-burst repeat table: a real sensor repeats the same ID; random CRC
-  // collisions do not. Only IDs seen in >=2 separate bursts are trustworthy.
-  static uint32_t seenId[32];
-  static uint8_t  seenCnt[32];
-  static int      seenN = 0;
+// [fromUs-2ms, toUs+2ms] のピークRSSI（サンプルが無ければ -127）
+static int lookupPeakRssi(uint32_t fromUs, uint32_t toUs, int* freqEstOut) {
+  int best = -127, bestFe = 0;
+  for (int i = 0; i < RSSI_HIST; i++) {
+    const RssiSample& s = g_rssiHist[i];
+    if (s.us == 0) continue;
+    if ((int32_t)(s.us - fromUs) < -2000) continue;
+    if ((int32_t)(s.us - toUs) > 2000) continue;
+    if (s.rssi > best) { best = s.rssi; bestFe = s.freqEst; }
+  }
+  if (freqEstOut) *freqEstOut = bestFe;
+  return best;
+}
 
-  int hu = 122;
-  int halfN = expandToHalfbits(dts, lvs, n, hu, bigHalf, (int)sizeof(bigHalf));
-  Serial.printf("    [BigDiag] half=%dus halfN=%d\n", hu, halfN);
-  if (halfN < 80) return;
-  for (int start = 0; start <= 16; start++) {
+// ====== Run decoder ======
+struct RunDecode {
+  ContinentalTPMSData data;
+  float    ir;             // パケット区間のマンチェスター不正ペア率
+  int      preambleScore;  // 日産プリアンブル一致数 (/36)
+  float    hrefUs;         // 実測半ビット長
+  float    biasUs;         // H/L 非対称補正量（Hに+、Lに-）
+  uint32_t pktStartUs;
+  uint32_t pktEndUs;
+  bool     crcNg;          // true: ID完全一致だが CRC 不一致（要確認フレーム）
+  int      erasures;       // フレーム内の不正ペア数
+};
+
+enum { RUN_NONE = 0, RUN_CRC_OK = 1, RUN_ID_HIT = 2 };
+
+// 半ビット公称値 hNom のパルス連続区間(ラン)をデコードする。
+// RUN_CRC_OK : 自車センサーID かつ CRC/範囲チェック合格
+// RUN_ID_HIT : 自車センサーID が32bit完全一致したが CRC 不一致（呼び出し側で繰返し確認）
+static int decodeRun(const Pulse* p, int n, int hNom, RunDecode* res, bool diag) {
+  memset(res, 0, sizeof(*res));
+  if (n <= 0) return RUN_NONE;
+  const uint32_t runStartUs = p[0].endUs - p[0].dur;
+
+  // 1) スライサの H/L 非対称を推定
+  //    周波数オフセットがあると「Hが短くLが長い」ように片寄る（例: 30H 75L）。
+  //    マンチェスターは各ビットに H/L 半ビットが1つずつある(DCバランス)ので、
+  //    H総時間とL総時間の差はそのまま「1パルスあたりの片寄り x パルス数」になる。
+  //    （パルス幅の分類に依存しないので、片寄りが大きいときも崩れない）
+  uint32_t sumDur = 0, sumH = 0, sumL = 0;
+  for (int i = 0; i < n; i++) {
+    sumDur += p[i].dur;
+    if (p[i].lv) sumH += p[i].dur; else sumL += p[i].dur;
+  }
+  float bias = ((float)sumL - (float)sumH) / (float)n;   // H に +bias、L に -bias
+  if (bias >  hNom * 0.45f) bias =  hNom * 0.45f;
+  if (bias < -hNom * 0.45f) bias = -hNom * 0.45f;
+
+  // 2) 補正後の幅で半ビット数を数え、実測の半ビット長 href を求める
+  //    （センサー側クロック誤差・ドリフトを吸収。2回反復で収束）
+  float href = (float)hNom;
+  for (int it = 0; it < 2; it++) {
+    uint32_t sumK = 0;
+    for (int i = 0; i < n; i++) {
+      float c = (float)p[i].dur + (p[i].lv ? bias : -bias);
+      sumK += (uint32_t)clampi((int)(c / href + 0.5f), 1, 6);
+    }
+    if (sumK > 0) href = (float)sumDur / (float)sumK;
+    if (href < hNom * 0.80f) href = hNom * 0.80f;
+    if (href > hNom * 1.25f) href = hNom * 1.25f;
+  }
+
+  // 3) 半ビット列へ展開
+  static uint8_t half[MAX_HALF];
+  int halfN = 0;
+  for (int i = 0; i < n && halfN < MAX_HALF; i++) {
+    float c = (float)p[i].dur + (p[i].lv ? bias : -bias);
+    int k = clampi((int)(c / href + 0.5f), 1, 6);
+    for (int j = 0; j < k && halfN < MAX_HALF; j++) half[halfN++] = p[i].lv;
+  }
+
+  // 4) マンチェスター位相(2) x 極性(2) x ビット位置(全域) を総当たり
+  //    → マンチェスター位相ズレによる「1ビットシフト＋NOT」もここで吸収される。
+  //    自車IDが完全一致した位置は、CRC NG でも「IDヒット」として保持する。
+  static uint8_t bits[MAX_HALF / 2];
+  static uint8_t tmp[72];
+  bool found = false;
+  float bestIr = 2.0f;
+  bool hit = false;
+  ContinentalTPMSData hitData = {};
+  int hitHs = 0, hitErasures = 0, hitParity = 0, hitInv = 0, hitBo = 0;
+  float hitIr = 2.0f;
+
+  for (int parity = 0; parity <= 1; parity++) {
     for (int inv = 0; inv <= 1; inv++) {
-      static uint8_t bits[400];
-      memset(bits, 0, sizeof(bits));
-      int sn = manchesterDecode(bigHalf + start, halfN - start, bits, (int)sizeof(bits), inv != 0);
-      if (sn < 64) continue;
+      int nb = manchesterDecode(half + parity, halfN - parity, bits, (int)sizeof(bits), inv != 0);
+      for (int bo = 0; bo + 64 <= nb; bo++) {
+        ContinentalTPMSData d = decodeContinentalTPMS(bits, nb, bo);
+        int hs = parity + 2 * bo;
 
-      // Try Continental decode at bit offsets 0-15 (up to 2 bytes of misalignment)
-      for (int bo = 0; bo <= 15 && bo + 64 <= sn; bo++) {
-        ContinentalTPMSData t = decodeContinentalTPMS(bits, sn, bo);
+        if (!d.valid) {
+          // ---- ID 完全一致だが CRC NG ----
+          if (!isMyCarSensor(d.sensorId)) continue;
 
-        // Only trust hits that look like a real packet: known brand byte and a
-        // plausible pressure. Kills random CRC collisions.
-        if (t.crcValid  && isMyCarSensor(t.sensorId) &&
-            t.pressurePsi >= 0.1f && t.pressurePsi <= 60.0f) {
-          Serial.printf("      --> CRC OK half=%d inv=%d start=%d bo=%d: brand=%02X ID=%08X PSI=%.1f %dC\n",
-                        hu, inv, start, bo, t.brand, t.sensorId,
-                        t.pressurePsi, (int)t.temperatureC);
-          return;  // only show first hit
+          // 消失訂正: 不正ペア(00/11)のビットは値が不確定なので、反対値も試す（最大4個＝16通り）
+          int nCopy = min(72, nb - bo);
+          int er[4]; int nEr = 0, nErAll = 0;
+          for (int j = 0; j < 64; j++) {
+            int hp = hs + 2 * j;
+            if (hp + 1 >= halfN) break;
+            if (half[hp] == half[hp + 1]) {
+              if (nEr < 4) er[nEr++] = j;
+              nErAll++;
+            }
+          }
+          if (nErAll > 0 && nErAll <= 4) {
+            for (int mask = 1; mask < (1 << nEr); mask++) {
+              memcpy(tmp, bits + bo, nCopy);
+              for (int e = 0; e < nEr; e++) if (mask & (1 << e)) tmp[er[e]] ^= 1;
+              ContinentalTPMSData d2 = decodeContinentalTPMS(tmp, nCopy, 0);
+              if (d2.valid && isMyCarSensor(d2.sensorId)) {
+                d2.bitOffset = bo;
+                d = d2;
+                break;
+              }
+            }
+          }
+          if (!d.valid) {
+            float ir = manchesterInvalidRate(half + hs, halfN - hs, 64);
+            if (!hit || ir < hitIr) {
+              hit = true; hitIr = ir; hitData = d; hitHs = hs;
+              hitErasures = nErAll; hitParity = parity; hitInv = inv; hitBo = bo;
+            }
+            continue;
+          }
+        }
+
+        float ir = manchesterInvalidRate(half + hs, halfN - hs, 64);
+        if (!isMyCarSensor(d.sensorId)) {
+          if (ENABLE_OTHER_SENSOR_ID_LOG && ir <= 0.0f) {
+            Serial.printf("  [Other] h=%d ID=%08X brand=%02X PSI=%.1f %.0fC\n",
+                          hNom, d.sensorId, d.brand, d.pressurePsi, d.temperatureC);
+          }
+          continue;
+        }
+        if (!found || ir < bestIr) {
+          found  = true;
+          bestIr = ir;
+          res->data       = d;
+          res->pktStartUs = runStartUs + (uint32_t)(hs * href);
+          res->pktEndUs   = res->pktStartUs + (uint32_t)(144 * href);
         }
       }
     }
   }
+
+  res->hrefUs = href;
+  res->biasUs = bias;
+
+  if (found || hit) {
+    bool pInv = false;
+    int score = 0;
+    findNissanPreamble(half, halfN, &pInv, &score, 0);
+    res->preambleScore = score;
+  }
+
+  if (found) {
+    res->ir = bestIr;
+    return RUN_CRC_OK;
+  }
+
+  if (hit) {
+    res->data       = hitData;
+    res->ir         = hitIr;
+    res->crcNg      = true;
+    res->erasures   = hitErasures;
+    res->pktStartUs = runStartUs + (uint32_t)(hitHs * href);
+    res->pktEndUs   = res->pktStartUs + (uint32_t)(144 * href);
+
+    // ID ヒットは貴重なので間引かず全部出す（パルス全量・不正ペア位置付き）
+    if (ENABLE_DETAILED_LOG) {
+      int fe = 0;
+      int rssi = lookupPeakRssi(runStartUs, p[n - 1].endUs, &fe);
+      const ContinentalTPMSData& d = hitData;
+      Serial.printf("  [IdHit CRC-NG] h=%d(%s) ID=%08X brand=%02X P=%02X T=%02X CRC=%02X(calc %02X)",
+                    hNom, (hNom == HALF_US_DRIVE) ? "DRIVE" : "PARK",
+                    d.sensorId, d.brand, d.pressureRaw, d.temperatureRaw,
+                    d.crcReceived, d.crcComputed);
+      if (d.hasExtra) Serial.printf(" extra=%02X", d.extraByte);
+      Serial.printf(" p=%d inv=%d bo=%d erasures=%d href=%.1f bias=%+.1f rssi=%d foff=%+.1fkHz\n",
+                    hitParity, hitInv, hitBo, hitErasures, href, bias, rssi, fe * 1.587f);
+      // フレーム内の不正ペア位置（フレーム先頭からのビット番号）
+      Serial.printf("    erasure bits:");
+      for (int j = 0; j < 72; j++) {
+        int hp = hitHs + 2 * j;
+        if (hp + 1 >= halfN) break;
+        if (half[hp] == half[hp + 1]) Serial.printf(" %d", j);
+      }
+      Serial.println();
+      // フレーム前後を含む半ビット列（| がフレーム先頭）
+      Serial.printf("    half: ");
+      for (int k = 0; k < halfN; k++) {
+        if (k == hitHs) Serial.print('|');
+        Serial.print(half[k] ? '1' : '0');
+      }
+      Serial.println();
+      Serial.printf("    pulses(%d): ", n);
+      for (int i = 0; i < n; i++) Serial.printf("%u%c ", p[i].dur, p[i].lv ? 'H' : 'L');
+      Serial.println();
+    }
+    return RUN_ID_HIT;
+  }
+
+  // 失敗時の診断（ノイズではラン自体が立たないので、ここに来るのは「信号らしいが解けない」もの）
+  if (diag) {
+    int fe = 0;
+    int rssi = lookupPeakRssi(runStartUs, p[n - 1].endUs, &fe);
+    Serial.printf("  [RunFail] h=%d(%s) pulses=%d dur=%.1fms href=%.1fus bias=%+.1fus halfN=%d rssi=%d dBm foff=%+.1fkHz\n",
+                  hNom, (hNom == HALF_US_DRIVE) ? "DRIVE" : "PARK", n,
+                  (p[n - 1].endUs - runStartUs) / 1000.0f, href, bias, halfN, rssi, fe * 1.587f);
+    int showN = n;
+    Serial.printf("    pulses: ");
+    for (int i = 0; i < showN; i++) Serial.printf("%u%c ", p[i].dur, p[i].lv ? 'H' : 'L');
+    Serial.println();
+    for (int parity = 0; parity <= 1; parity++) {
+      int nb = manchesterDecode(half + parity, halfN - parity, bits, (int)sizeof(bits), false);
+      float ir = manchesterInvalidRate(half + parity, halfN - parity, 400);
+      Serial.printf("    manch p=%d ir=%.2f (%dbit): ", parity, ir, nb);
+      int nBytes = min(16, nb / 8);
+      for (int b = 0; b < nBytes; b++) {
+        uint8_t v = 0;
+        for (int k = 0; k < 8; k++) v = (uint8_t)((v << 1) | (bits[b * 8 + k] & 1));
+        Serial.printf("%02X ", v);
+      }
+      Serial.println();
+    }
+  }
+  return RUN_NONE;
 }
 
 // ====== CC1101 init (retryable) ======
@@ -1105,11 +1154,10 @@ static bool radioTryInit(bool verbose = true) {
   uint8_t partnum = ccReadStatus(RADIOLIB_CC1101_REG_PARTNUM);
   uint8_t version = ccReadStatus(RADIOLIB_CC1101_REG_VERSION);
 
-  // CC1101 init: 8.192 kbps (=1/122us), FSK dev 40 kHz
-  // RxBW narrowed 325->162kHz to cut noise bandwidth (~+4dB sensitivity) for the
+  // CC1101 init: 32.768 kbps (=1/32.768us), FSK dev 40 kHz
   // marginal in-vehicle link. Wide enough for +-40kHz deviation + crystal error.
-  // MX-Sensor (Autel) は 162kHzのほうがよさそう
-  int st = radio.begin(RX_FREQ_MHZ, 8.192, 40.0, 162.0);
+  // RxBW 232 kHz
+  int st = radio.begin(RX_FREQ_MHZ, 32.768, 40.0, 232.0);
   if (verbose || st == RADIOLIB_ERR_NONE) {
     Serial.printf("radio.begin = %d (PARTNUM=0x%02X VERSION=0x%02X)\n", st, partnum, version);
   }
@@ -1121,9 +1169,8 @@ static bool radioTryInit(bool verbose = true) {
   ccEnableAsyncOnGDO2();
 
   noInterrupts();
-  edgeN = 0;
-  burstReady = false;
-  lastEdgeUs = micros();
+  edgeWr = 0;
+  g_procEnd = 0;
   interrupts();
 
   attachInterrupt(digitalPinToInterrupt(PIN_GDO2), isrGdo2, CHANGE);
@@ -1137,11 +1184,153 @@ static uint32_t g_radioLostCount = 0;
 static void radioMarkLost() {
   detachInterrupt(digitalPinToInterrupt(PIN_GDO2));
   noInterrupts();
-  edgeN = 0;
-  burstReady = false;
+  edgeWr = 0;
+  g_procEnd = 0;
   interrupts();
   g_radioReady = false;
   g_radioLostCount++;
+}
+
+// ====== Window processing ======
+static uint32_t g_cntWindows = 0, g_cntRunDrive = 0, g_cntRunPark = 0;
+static uint32_t g_cntDecDrive = 0, g_cntDecPark = 0, g_cntDup = 0;
+static uint32_t g_cntOverflow = 0, g_cntRxKick = 0;
+static int      g_maxRunLen = 0;
+static int      g_decodedRssiMax = -127;
+
+static void handleDecoded(const RunDecode& rd, int hNom, int runLen) {
+  // 窓の重なりで同じパケットを二度デコードしたものを捨てる
+  static uint32_t recentId[8] = {};
+  static uint32_t recentUs[8] = {};
+  static int recentWr = 0;
+  for (int i = 0; i < 8; i++) {
+    if (recentId[i] != rd.data.sensorId) continue;
+    int32_t dd = (int32_t)(rd.pktStartUs - recentUs[i]);
+    if (dd < 0) dd = -dd;
+    if (dd < 4000) { g_cntDup++; return; }
+  }
+  recentId[recentWr] = rd.data.sensorId;
+  recentUs[recentWr] = rd.pktStartUs;
+  recentWr = (recentWr + 1) & 7;
+
+  if (hNom == HALF_US_DRIVE) g_cntDecDrive++; else g_cntDecPark++;
+
+  int fe = 0;
+  int rssi = lookupPeakRssi(rd.pktStartUs, rd.pktEndUs, &fe);
+  if (rssi > g_decodedRssiMax) g_decodedRssiMax = rssi;
+
+  const ContinentalTPMSData& d = rd.data;
+  int recIdx = trackSensor(d);
+
+  Serial.printf("[Continental TPMS] ID=%08X brand=%02X PSI=%.1f kPa=%.0f bar=%.2f Temp=%dC rssi=%d dBm CRC=%02X(%s) sc=%d/36 count=%d",
+                d.sensorId, d.brand,
+                d.pressurePsi, d.pressureKpa, d.pressureBar,
+                (int)d.temperatureC, rssi,
+                d.crcReceived, d.crcValid ? "OK" : "NG",
+                rd.preambleScore, sensorRecords[recIdx].count);
+  if (d.hasExtra) Serial.printf(" extra=%02X seq=%d", d.extraByte, d.sequence);
+  if (d.driveFormat) Serial.printf(" DRIVE9 flags=%02X", d.driveFlags);
+  if (d.pressureAlert) Serial.printf(" ALERT");
+  if (d.batteryLow) Serial.printf(" BATLOW");
+  Serial.printf(" (%s h=%d href=%.1f bias=%+.1f run=%d ir=%.2f foff=%+.1fkHz)%s\n",
+                (hNom == HALF_US_DRIVE) ? "DRIVE" : "PARK", hNom,
+                rd.hrefUs, rd.biasUs, runLen, rd.ir, fe * 1.587f,
+                rd.crcNg ? " [CRC-NG confirmed by repeat]" : "");
+
+  // ---- LCD update (CRC verified = trusted) ----
+  int lcdSlot = sensorRecords[recIdx].lcdSlot;
+  if (lcdSlot >= 0 && lcdSlot < LCD_SENSOR_COUNT) {
+    lcdUpdateTire(lcdSlot, d.sensorId,
+                  d.pressurePsi, d.pressureBar,
+                  d.pressureKpa, d.temperatureC);
+    g_displayStateDirty = true;
+  }
+}
+
+// ID完全一致・CRC NG のフレームを繰返しで確認する。
+// 別パケット(4ms以上離れた)で「同じID・同じ brand/P/T/CRC」が60秒以内に2回揃えば採用。
+// ランダムなビット誤りなら同じ誤り方を繰り返す可能性はほぼ無いので、
+// 「走行モードでは CRC の取り方が違う」場合にも表示できる。
+static uint32_t g_cntIdHit = 0, g_cntIdHitConfirmed = 0;
+
+static void handleIdHit(RunDecode& rd, int hNom, int runLen) {
+  g_cntIdHit++;
+  const ContinentalTPMSData& d = rd.data;
+  if (d.temperatureC < -40.0f || d.temperatureC > 100.0f) return;
+  if (d.pressurePsi > 80.0f) return;
+
+  struct Pending {
+    uint32_t id, us, ms;
+    uint8_t  brand, p, t, crc;
+  };
+  static Pending pend[8] = {};
+  static int pendWr = 0;
+  uint32_t nowMs = millis();
+
+  for (int i = 0; i < 8; i++) {
+    Pending& q = pend[i];
+    if (q.id != d.sensorId || q.ms == 0) continue;
+    if (nowMs - q.ms > 60000) continue;
+    int32_t dd = (int32_t)(rd.pktStartUs - q.us);
+    if (dd < 0) dd = -dd;
+    if (dd < 4000) return;  // 窓の重なりで同一パケットを再検出しただけ
+    if (q.brand == d.brand && q.p == (uint8_t)d.pressureRaw &&
+        q.t == (uint8_t)d.temperatureRaw && q.crc == d.crcReceived) {
+      q.ms = 0;  // 使用済み
+      g_cntIdHitConfirmed++;
+      rd.data.valid = true;
+      handleDecoded(rd, hNom, runLen);
+      return;
+    }
+  }
+  Pending& w = pend[pendWr];
+  w.id = d.sensorId; w.us = rd.pktStartUs; w.ms = nowMs;
+  w.brand = d.brand; w.p = (uint8_t)d.pressureRaw;
+  w.t = (uint8_t)d.temperatureRaw; w.crc = d.crcReceived;
+  pendWr = (pendWr + 1) & 7;
+}
+
+// 1窓分のエッジ列から「半ビット 61us / 122us のマンチェスターらしい連続区間」を探し、
+// 見つかった区間だけをデコードする。前後のノイズは区間に入らないので混入しない。
+static void processWindow(const uint32_t* t, const uint8_t* lv, int n) {
+  static Pulse   raw[WIN_EDGES];
+  static Pulse   mp[WIN_EDGES];
+  static uint8_t good[WIN_EDGES];
+  static uint32_t lastDiagMs = 0;
+
+  int rn = buildPulses(t, lv, n, raw);
+  if (rn < MIN_RUN_PULSES) return;
+
+  static const int H_LIST[2] = { HALF_US_DRIVE, HALF_US_PARK };
+  for (int hi = 0; hi < 2; hi++) {
+    const int h = H_LIST[hi];
+    // 0.35h 未満はスパイクとして吸収（DRIVE で約19us未満: 短いヒゲ対策）
+    int mn = mergeGlitches(raw, rn, h * 35 / 100, mp);
+    markGood(mp, mn, h, good);
+
+    int i = 0;
+    while (i < mn) {
+      if (!good[i]) { i++; continue; }
+      int s = i;
+      while (i < mn && good[i]) i++;
+      int len = i - s;
+      if (len < MIN_RUN_PULSES) continue;
+
+      if (h == HALF_US_DRIVE) g_cntRunDrive++; else g_cntRunPark++;
+      if (len > g_maxRunLen) g_maxRunLen = len;
+
+      bool diag = ENABLE_DETAILED_LOG && (millis() - lastDiagMs >= 1000);
+      RunDecode rd;
+      int r = decodeRun(mp + s, len, h, &rd, diag);
+      if (r == RUN_CRC_OK) {
+        handleDecoded(rd, h, len);
+      } else if (r == RUN_ID_HIT) {
+        handleIdHit(rd, h, len);
+      } else if (diag) {
+        lastDiagMs = millis();
+      }
+    }
+  }
 }
 
 // ====== setup() ======
@@ -1192,7 +1381,7 @@ void setup() {
                   KNOWN_SENSORS[i].partNo, KNOWN_SENSORS[i].fullId,
                   KNOWN_SENSORS[i].lcdSlot);
   }
-  Serial.println("Waiting for TPMS packets (halfUs 100-150us filter)...");
+  Serial.println("Waiting for TPMS packets (half-bit ~52us=DRIVE / 122us=PARK)...");
 }
 
 // ====== loop() ======
@@ -1239,98 +1428,76 @@ void loop() {
         lcdShowFatalNote("re-init...");
         return;
       }
+      // 非同期モードでは通常 RX に居続けるが、万一落ちていたら戻す。
+      uint8_t ms = ccReadStatus(RADIOLIB_CC1101_REG_MARCSTATE) & 0x1F;
+      if (ms != 0x0D && ms != 0x0E && ms != 0x0F) {
+        radio.startReceive();
+        g_cntRxKick++;
+      }
     }
   }
 
-  static uint32_t lastKickMs = 0;
-  static uint32_t cntBurst = 0, cntInRange = 0;
-  static uint32_t cntPreamble = 0, cntDecoded = 0;
-  // Packet-sized bursts (edges >= BIG_BURST_EDGES): a real Continental packet
-  // needs ~150-260 edges. Tracks whether such bursts arrive but get filtered out.
-  static const int BIG_BURST_EDGES = 120;
-  static uint32_t cntBig = 0, cntBigDropped = 0;
-  static int      maxEdgesSeen = 0;
-  // Ambient RSSI (noise floor): distinguishes a noisy vehicle RF environment
-  // from a weak-signal/antenna problem. Sampled when idle (no active burst).
-  static int      rssiMin = 127, rssiMax = -127, rssiCnt = 0;
-  static long     rssiSum = 0;
-  static uint32_t lastRssiMs = 0;
-  // Peak RSSI sampled DURING a burst -> how far the burst rises above the floor.
-  static int      curBurstRssiMax = -127;   // resets per burst
-  static int      bigRssiMax = -127;         // peak among big bursts (STATS)
-  // FREQEST at the burst peak: receiver-vs-sensor carrier offset. A large offset
-  // means we are losing sensitivity and 315.0MHz should be retuned.
-  static int      curBurstFreqEst = 0;
-
-  uint32_t nowUs = micros();
-
- // ============================================================
-  // Force-finalize burst (どれか1つでも満たしたら即座に処理へ回す)
-  // ============================================================
-  if (!burstReady) {
-    // 【大元のバッファ上限セーフティ】（クラッシュ防止リミッター）
-    // 配列の最大サイズ（MAX_EDGES=4000）を突き抜けてメモリ破壊・ハングアップを起こすのを
-    // 絶対に防ぐための、システム全体の最下層の鉄壁リミッターです。そのまま残します。
-    if (edgeN >= (MAX_EDGES - 10)) {
-      noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
-    }
-    // 【長時間タイムアウトセーフティ】
-    // エッジ数が250に達しないような中途半端なノイズが、延々とバッファに
-    // 居座り続けるのを防ぐため、40ms 経過したら強制リセットして次へ回します。
-    if (edgeN > 30 && (nowUs - burstStartUs > 40000)) {
-      noInterrupts(); burstReady = true; burstEndUs = micros(); interrupts();
+  // ---- RX 再スタート（2秒毎）----
+  // AFC/AGC のリセットを兼ねて定期的に startReceive() する。
+  // 頻繁にやると IDLE->RX 校正(約1ms)の不感時間が積み重なるので 2秒毎に間引く。
+  {
+    static uint32_t lastKickMs = 0;
+    if (millis() - lastKickMs >= 2000) {
+      lastKickMs = millis();
+      radio.startReceive();
     }
   }
 
-  // LCD refresh
+  // ---- LCD refresh ----
   {
     static uint32_t lastLcdMs = 0;
     if (millis() - lastLcdMs >= 200) { lastLcdMs = millis(); lcdRefresh(); }
   }
 
-  // RSSI sampling: noise floor when idle, peak signal while a burst is captured
-  if ((millis() - lastRssiMs) >= 2) {
-    lastRssiMs = millis();
-    int r = ccRssiDbm();
-    // アンテナ導通の即時確認用。キーフォブ(315MHz)を押せば -40..-60dBm が出るはず。
-    // 何も出ない = アンテナ未接続を疑う。
-    {
+  // ---- RSSI sampling (2ms) ----
+  static int  rssiMin = 127, rssiMax = -127, rssiCnt = 0;
+  static long rssiSum = 0;
+  {
+    static uint32_t lastRssiMs = 0;
+    if ((millis() - lastRssiMs) >= 2) {
+      lastRssiMs = millis();
+      int r = ccRssiDbm();
+      int fe = 0;
+      if (r >= -100) {
+        uint8_t raw = ccReadStatus(RADIOLIB_CC1101_REG_FREQEST);
+        fe = (raw >= 128) ? (raw - 256) : raw;
+      }
+      pushRssiSample(micros(), r, fe);
+
+      // アンテナ導通の即時確認用。キーフォブ(315MHz)を押せば -40..-60dBm が出るはず。
       static uint32_t lastStrongMs = 0;
       if (r > -90 && (millis() - lastStrongMs) >= 200) {
         lastStrongMs = millis();
         Serial.printf("  [Strong] rssi=%d dBm\n", r);
       }
-    }
-    if (edgeN == 0) {
       if (r < rssiMin) rssiMin = r;
       if (r > rssiMax) rssiMax = r;
       rssiSum += r; rssiCnt++;
-    } else if (!burstReady) {
-      if (r > curBurstRssiMax) {
-        curBurstRssiMax = r;
-        uint8_t fe = ccReadStatus(RADIOLIB_CC1101_REG_FREQEST);
-        curBurstFreqEst = (fe >= 128) ? (fe - 256) : fe;
-      }
     }
   }
 
-  // Stats (60s)
+  // ---- Stats (60s) ----
   {
     static uint32_t lastStatMs = 0;
     if (millis() - lastStatMs >= 60000) {
       lastStatMs = millis();
-      Serial.printf("\n=== STATS bursts=%lu inRange=%lu preamble=%lu decoded=%lu sensors=%d ===\n",
-                    (unsigned long)cntBurst, (unsigned long)cntInRange,
-                    (unsigned long)cntPreamble, (unsigned long)cntDecoded,
-                    sensorRecordCount);
-      Serial.printf("    big(>=%d edges)=%lu dropped=%lu maxEdges=%d\n",
-                    BIG_BURST_EDGES, (unsigned long)cntBig,
-                    (unsigned long)cntBigDropped, maxEdgesSeen);
-      Serial.printf("    noiseFloor RSSI min=%d avg=%d max=%d dBm (n=%d)\n",
+      Serial.printf("\n=== STATS windows=%lu runs(DRIVE/PARK)=%lu/%lu decoded(DRIVE/PARK)=%lu/%lu dup=%lu sensors=%d ===\n",
+                    (unsigned long)g_cntWindows,
+                    (unsigned long)g_cntRunDrive, (unsigned long)g_cntRunPark,
+                    (unsigned long)g_cntDecDrive, (unsigned long)g_cntDecPark,
+                    (unsigned long)g_cntDup, sensorRecordCount);
+      Serial.printf("    maxRun=%d pulses  idHit(CRC-NG)=%lu confirmed=%lu  overflow=%lu  rxKick=%lu  rfLost=%lu\n",
+                    g_maxRunLen, (unsigned long)g_cntIdHit, (unsigned long)g_cntIdHitConfirmed,
+                    (unsigned long)g_cntOverflow,
+                    (unsigned long)g_cntRxKick, (unsigned long)g_radioLostCount);
+      Serial.printf("    RSSI min=%d avg=%d max=%d dBm (n=%d)  decoded peak=%d dBm\n",
                     (rssiCnt ? rssiMin : 0), (rssiCnt ? (int)(rssiSum / rssiCnt) : 0),
-                    (rssiCnt ? rssiMax : 0), rssiCnt);
-      Serial.printf("    bigBurst peak RSSI max=%d dBm  rfLost=%lu\n",
-                    bigRssiMax, (unsigned long)g_radioLostCount);
+                    (rssiCnt ? rssiMax : 0), rssiCnt, g_decodedRssiMax);
       for (int i = 0; i < sensorRecordCount; i++) {
         uint32_t age = (millis() - sensorRecords[i].lastSeenMs) / 1000;
         Serial.printf("  ID=%08X count=%d PSI=%.1f %.0fC slot=%d (%lus ago)\n",
@@ -1338,320 +1505,46 @@ void loop() {
                       sensorRecords[i].lastPsi, sensorRecords[i].lastTempC,
                       sensorRecords[i].lcdSlot, (unsigned long)age);
       }
-      cntBurst = 0; cntInRange = 0; cntPreamble = 0; cntDecoded = 0;
-      cntBig = 0; cntBigDropped = 0; maxEdgesSeen = 0;
+      g_cntWindows = 0; g_cntRunDrive = 0; g_cntRunPark = 0;
+      g_cntDecDrive = 0; g_cntDecPark = 0; g_cntDup = 0;
+      g_cntOverflow = 0; g_cntRxKick = 0; g_maxRunLen = 0;
+      g_cntIdHit = 0; g_cntIdHitConfirmed = 0;
+      g_decodedRssiMax = -127;
       rssiMin = 127; rssiMax = -127; rssiSum = 0; rssiCnt = 0;
-      bigRssiMax = -127;
     }
   }
 
-  if (!burstReady) return;
-
-  // ---- Copy ISR buffer ----
-  static uint16_t dts[MAX_EDGES];
-  static uint8_t  lvs[MAX_EDGES];
-  int n;
-  uint32_t bStart, bEnd;
-
-  noInterrupts(); // 一時的に新しい割り込みを止めて、データが書き換わるのを防ぐ
-  n = edgeN;      // 溜まったエッジ数（250本など）をコピー
-  if (n > MAX_EDGES) n = MAX_EDGES;
-    // ここで dtBuf（割り込みが溜めた生データ）を、dts（loop側で解析するための配列）へ吸い出す！
-  for (int i = 0; i < n; i++) { dts[i] = dtBuf[i]; lvs[i] = lvBuf[i]; }
-  bStart = burstStartUs;
-  bEnd   = burstEndUs;
-  edgeN = 0;
-  burstReady = false;
-  interrupts();
-
-  uint32_t dur = bEnd - bStart;
-  cntBurst++;
-  if (n > maxEdgesSeen) maxEdgesSeen = n;
-  bool bigBurst = (n >= BIG_BURST_EDGES);
-  if (bigBurst) cntBig++;
-  int burstRssi = curBurstRssiMax;   // peak RSSI captured during this burst
-  curBurstRssiMax = -127;
-  int burstFreqEst = curBurstFreqEst;
-  curBurstFreqEst = 0;
-  if (bigBurst && burstRssi > bigRssiMax) bigRssiMax = burstRssi;
-
-  // ---- Basic filters ----
-  if (dur < 3000 || dur > 300000 || n < MIN_EDGES) {
-    if (bigBurst) cntBigDropped++;
-    radio.startReceive();
-    return;
-  }
-
-  // ---- Estimate half-bit period ----
-  float peakFrac = 0.0f;
-  int halfUs = estimateHalfBitUs(dts, n, &peakFrac);
-
-  // ─── 【マルチパス・サチュレーション救済ゲート】───
-  // RSSI が -70dBm 以上に跳ね上がり、パルスが 37us や 47us に
-  // ズタズタに潰されている場合、これは自車センサーの超強力パケットの悲鳴です。
-  // 問答無用で halfUs = 122 に強制書き換えして合格ゲートを突破させます！
-
-  if (burstRssi >= -75 && (halfUs < 100 || halfUs > 150)) {
-    halfUs = 122; // 強制的に Continental 基準値に上書きして下のデコーダーへ叩き込む！
-  }
-
-  // ============================================================
-  // KEY FILTER: halfUs must be 100-150us (Continental/Nissan TPMS)
-  // Eliminates false triggers from noise at h=46, 52, 64 etc.
-  // ============================================================
-  if (halfUs < 100 || halfUs > 150) {
-    // A packet-sized burst rejected here may be a real packet with a skewed
-    // halfUs estimate -> dump raw timing (throttled) to read its true bit period.
-    if (bigBurst && ENABLE_DETAILED_LOG && (ENABLE_BIGDROP_DETAILED_LOG || (burstRssi >= -89))) {
-      cntBigDropped++;
-      static uint32_t lastBigMs = 0;
-      if (millis() - lastBigMs >= 2000) {
-        lastBigMs = millis();
-        Serial.printf("  [BigDrop halfUs] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
-                      n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);
-        // dt-histogram: top 6 peaks (5us bins) to reveal the real half-bit period
-        static uint16_t dtBins[61];
-        memset(dtBins, 0, sizeof(dtBins));
-        for (int i = 0; i < n; i++) {
-          int bin = dts[i] / 5;
-          if (bin >= 0 && bin < 61) dtBins[bin]++;
-        }
-        Serial.printf("    dt-hist: ");
-        for (int top = 0; top < 6; top++) {
-          int bestBin = -1; uint16_t bestCntB = 0;
-          for (int b = 0; b < 61; b++)
-            if (dtBins[b] > bestCntB) { bestCntB = dtBins[b]; bestBin = b; }
-          if (bestBin < 0 || bestCntB == 0) break;
-          Serial.printf("%d-%dus(%d) ", bestBin * 5, bestBin * 5 + 4, bestCntB);
-          dtBins[bestBin] = 0;
-        }
-        Serial.println();
-        int showN = min(n, 48);
-        Serial.printf("    edges[0..%d]: ", showN - 1);
-        for (int i = 0; i < showN; i++)
-          Serial.printf("%u%c ", dts[i], lvs[i] ? 'H' : 'L');
-        Serial.println();
-        // Attempt decode at fixed half-bit candidates (61/122us) to find the packet
-        diagBigBurst(dts, lvs, n, dur / 1000);
-      }
-    }
-    radio.startReceive();
-    return;
-  }
-
-  if (peakFrac < 0.15f  && ENABLE_DETAILED_LOG) {
-    if (bigBurst) {
-      cntBigDropped++;
-      static uint32_t lastBigMs = 0;
-      if (millis() - lastBigMs >= 1000) {
-        lastBigMs = millis();
-        Serial.printf("  [BigDrop pf] n=%d dur=%lums halfUs=%d pf=%.2f\n",
-                      n, (unsigned long)(dur / 1000), halfUs, peakFrac);
-      }
-    }
-    radio.startReceive();
-    return;
-  }
-
-  cntInRange++;
-
-  // Per-burst signal strength for the candidate TPMS fragments (throttled).
+  // ---- Edge window analysis ----
+  // リングバッファから WIN_EDGES 本ずつ、前回と WIN_OVERLAP 本重ねて切り出す。
   {
-    static uint32_t lastIrMs = 0;
-    if (millis() - lastIrMs >= 1000) {
-      lastIrMs = millis();
-      if(ENABLE_DETAILED_LOG) {Serial.printf("  [InRange] n=%d dur=%lums halfUs=%d pf=%.2f rssi=%d dBm\n",
-                    n, (unsigned long)(dur / 1000), halfUs, peakFrac, burstRssi);}
+    static uint32_t lastProcUs = 0;
+    static uint32_t winT[WIN_EDGES];
+    static uint8_t  winLv[WIN_EDGES];
+
+    uint32_t wr = edgeWr;
+    uint32_t avail = wr - g_procEnd;
+    if (avail > EDGE_RING_SIZE - 2 * (uint32_t)WIN_EDGES) {
+      // loop が詰まって追いつけなかった（古い分は捨てる）
+      g_procEnd = wr - WIN_STEP;
+      avail = WIN_STEP;
+      g_cntOverflow++;
     }
-  }
-
-  // ─── 走行ノイズによる物差しのブレを、本物の 122us に叩き直す ───
-  // 100〜150us（Continentalゲート）を合格したものは、ノイズで多少ブレていようが、
-  // 物理的な真値は100%「122us（データレート8.192kbps）」です。
-  // ここで 122us 固定にしてから下の expandToHalfbits に引き渡すことで、
-  // 先ほど中身を書き換えた「動的追従（PLL）」が最高精度で綺麗にロックオンを始めます！
-  halfUs = 122;
-
-  // ---- Expand to half-bits ----
-  static uint8_t halfLv[8000];
-  memset(halfLv, 0, sizeof(halfLv));
-  int halfN = expandToHalfbits(dts, lvs, n, halfUs, halfLv, (int)sizeof(halfLv));
-
-  // ---- Dual preamble detection ----
-  bool isInverted = false;
-  int preambleScore = 0;
-  int dataStart = findNissanPreamble(halfLv, halfN, &isInverted, &preambleScore, 25);
-
-  int altPos = 0, altEnd = 0;
-  int altRun = findAlternatingRun(halfLv, halfN, &altPos, &altEnd);
-
-  // ---- Should we process this burst? ----
-  bool hasNissanPreamble = (preambleScore >= 28 && dataStart >= 0);
-  bool hasGoodAltRun = (altRun >= 20 && peakFrac >= 0.40f);
-  bool diagWorthy = (preambleScore >= 25) || hasGoodAltRun;
-
-  if (!hasNissanPreamble && !diagWorthy) {
-    radio.startReceive();
-    return;
-  }
-
-  // ---- Determine decode start position ----
-  int decodeStart = -1;
-  if (hasNissanPreamble) {
-    decodeStart = dataStart;
-  } else if (hasGoodAltRun && altEnd < halfN) {
-    decodeStart = altEnd;  // try from end of alternating run
-  }
-
-  // ---- DIAG output + full burst CRC scan ----
-  ContinentalTPMSData diagFound = printDiag(dts, lvs, n, halfLv, halfN, halfUs,
-            dur / 1000, peakFrac,
-            preambleScore, isInverted, altRun, altEnd, decodeStart);
-
-  // ---- Full burst scan: try Manchester decode from multiple positions ----
-  // This catches packets where preamble was partially captured
-  if (!diagFound.valid && halfN >= 130) {
-    for (int scanStart = 0; scanStart <= halfN - 130; scanStart += 2) {
-      float ir = manchesterInvalidRate(halfLv + scanStart, halfN - scanStart, 40);
-      if (ir > 0.25f) continue;
-      for (int invMode = 0; invMode <= 1; invMode++) {
-        static uint8_t scanBits[400];
-        memset(scanBits, 0, sizeof(scanBits));
-        int scanN = manchesterDecode(halfLv + scanStart, halfN - scanStart,
-                                     scanBits, (int)sizeof(scanBits), invMode != 0);
-        if (scanN < 65) continue;
-        for (int bo = 0; bo <= 15 && bo + 64 <= scanN; bo++) {
-          ContinentalTPMSData trial = decodeContinentalTPMS(scanBits, scanN, bo);
-          if (trial.valid && isMyCarSensor(trial.sensorId)) {
-            diagFound = trial;
-            goto scanDone;
-          }
-        }
+    uint32_t nowUs = micros();
+    if (avail >= (uint32_t)WIN_STEP ||
+        (avail > 0 && (uint32_t)(nowUs - lastProcUs) >= WIN_MAX_LATENCY_US)) {
+      lastProcUs = nowUs;
+      uint32_t start = (g_procEnd >= (uint32_t)WIN_OVERLAP) ? (g_procEnd - WIN_OVERLAP) : 0;
+      uint32_t end = wr;
+      if (end - start > (uint32_t)WIN_EDGES) end = start + WIN_EDGES;
+      int n = (int)(end - start);
+      for (int i = 0; i < n; i++) {
+        uint32_t idx = (start + (uint32_t)i) & EDGE_RING_MASK;
+        winT[i]  = edgeTimeBuf[idx];
+        winLv[i] = edgeLvBuf[idx];
       }
+      g_procEnd = end;
+      g_cntWindows++;
+      processWindow(winT, winLv, n);
     }
-    scanDone:;
-  }
-
-  // ---- Check if enough data for normal decode ----
-  // decodeStart はプリアンブル終端の推定値で、数ハーフビット遅すぎることがある。
-  // 前方にも振るので、判定もその分だけ緩める。
-  static const int HALF_OFF_MIN = -8;
-  int remaining = (decodeStart >= 0) ? halfN - decodeStart : 0;
-  if (remaining < (130 + HALF_OFF_MIN) && !diagFound.valid ) {
-    if(ENABLE_DETAILED_LOG) {
-      Serial.printf("  [NoData] halfN=%d decodeStart=%d remaining=%d (need ~130 half-bits for 64-bit Continental)\n",
-                    halfN, decodeStart, remaining);
-    }
-    
-    cntPreamble++;
-    radio.startReceive();
-    return;
-  }
-
-  cntPreamble++;
-
-  // ---- Continental TPMS decode ----
-  // Manchester decode at even half-bit offsets (0 and 2),
-  // both inversions, then try bit alignments 0-7 in decoded stream.
-  ContinentalTPMSData bestData = {};
-  float bestInvRate = 1.0f;
-
-  for (int invMode = 0; invMode <= 1; invMode++) {
-    for (int halfOff = HALF_OFF_MIN; halfOff <= 2; halfOff += 2) {  // even offsets
-      int start = decodeStart + halfOff;
-      if (start < 0 || start + 130 > halfN) continue;
-
-      float invRate = manchesterInvalidRate(halfLv + start, halfN - start, 40);
-      if (invRate > 0.30f) continue;  // too many invalid pairs
-
-      static uint8_t trialBits[400];
-      memset(trialBits, 0, sizeof(trialBits));
-      int trialN = manchesterDecode(halfLv + start, halfN - start,
-                                    trialBits, (int)sizeof(trialBits), invMode != 0);
-      if (trialN < 65) continue;  // need at least 1 skip + 64 data bits
-
-      // 実走時の激しいズレ（bitOff=12など）を跨ぎきるため、探索幅を 15（1.5バイト分）へ拡張！
-      // これにより、大元のプリアンブル検索を]すり抜けた走行フレームをここで1本残らず完璧に仕留めます。
-      for (int bitOff = 0; bitOff <= 15 && bitOff + 64 <= trialN; bitOff++) {
-        ContinentalTPMSData trial = decodeContinentalTPMS(trialBits, trialN, bitOff);
-
-        if (trial.valid && isMyCarSensor(trial.sensorId)) {
-          bool isBetter = false;
-          if (!bestData.valid)               isBetter = true;
-          else if (invRate < bestInvRate)     isBetter = true;
-          if (isBetter) {
-            bestData = trial;
-            bestInvRate = invRate;
-          }
-        } else if (trial.crcValid &&
-                   trial.temperatureC >= -40.0f && trial.temperatureC <= 100.0f &&
-                   trial.sensorId != 0 && trial.sensorId != 0xFFFFFFFF) {
-          // CRC は通ったが brand が 0xA8/0x98 以外。トリガーツール応答など
-          // 別ファンクションのフレームを取りこぼしていないか見るため出力する。
-          static uint32_t lastRejMs = 0;
-          if (millis() - lastRejMs >= 2000) {
-            lastRejMs = millis();
-            Serial.printf("  [CRCok-Rejected] brand=0x%02X ID=%08X PSI=%.1f %.0fC\n",
-                          trial.brand, trial.sensorId,
-                          trial.pressurePsi, trial.temperatureC);
-          }
-        }
-      }
-    }
-  }
-
-  if (!bestData.valid) {
-    // Use DIAG/scan result as fallback
-    if (diagFound.valid) {
-      bestData = diagFound;
-      bestInvRate = 0.0f;
-    } else {
-      static uint32_t lastFailMs = 0;
-      if (millis() - lastFailMs >= 3000) {
-        lastFailMs = millis();
-        if (ENABLE_DETAILED_LOG) {
-          Serial.printf("  [DecodeFail] No valid CRC-8 match found (halfUs=%d)\n", halfUs);
-        }
-      }
-      delay(calcReceiveWaitMs(burstRssi));
-      radio.startReceive();
-      return;
-    }
-  }
-
-  cntDecoded++;
-
-  // ---- Sensor tracking ----
-  int recIdx = trackSensor(bestData);
-
-  // ---- Serial output ----
-  Serial.printf("[Continental TPMS] ID=%08X brand=%02X PSI=%.1f kPa=%.0f bar=%.2f Temp=%dC rssi=%d dBm CRC=%02X(%s) sc=%d/36 count=%d",
-                bestData.sensorId, bestData.brand,
-                bestData.pressurePsi, bestData.pressureKpa, bestData.pressureBar,
-                (int)bestData.temperatureC,
-                burstRssi,
-                bestData.crcReceived, bestData.crcValid ? "OK" : "NG",
-                preambleScore,
-                sensorRecords[recIdx].count);
-  if (bestData.bitOffset != 0) Serial.printf(" bitOff=%d", bestData.bitOffset);
-  if (bestData.hasExtra) Serial.printf(" extra=%02X seq=%d", bestData.extraByte, bestData.sequence);
-  if (bestData.pressureAlert) Serial.printf(" ALERT");
-  if (bestData.batteryLow) Serial.printf(" BATLOW");
-  Serial.printf(" (h=%d pf=%.2f ir=%.2f foff=%+.1fkHz)\n",
-                halfUs, peakFrac, bestInvRate, burstFreqEst * 1.587f);
-
-  // ---- LCD update (CRC verified = trusted) ----
-  int lcdSlot = sensorRecords[recIdx].lcdSlot;
-  if (lcdSlot >= 0 && lcdSlot < LCD_SENSOR_COUNT) {
-    lcdUpdateTire(lcdSlot, bestData.sensorId,
-                  bestData.pressurePsi, bestData.pressureBar,
-                  bestData.pressureKpa, bestData.temperatureC);
-    g_displayStateDirty = true;
-  }
-  radio.startReceive();
-
-  if (millis() - lastKickMs > 3000) {
-    lastKickMs = millis();
-    radio.startReceive();
   }
 }
