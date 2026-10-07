@@ -12,7 +12,7 @@
 //
 // Protocol (reverse-engineered from captures + BMW Gen5 reference):
 //   Modulation  : FSK, Manchester coded (G.E. Thomas)
-//   Half-bit    : 122us (park mode) / ~52us measured (drive mode, nominal 61us)
+//   Half-bit    : 122us (park, 4096 bps) / ~52us measured (drive, ~9.6 kbps)
 //   Preamble    : Alternating 0/1 run (~28+ half-bits)
 //   Data (8 bytes = 64 bits, at bit offset 1 from Manchester decode):
 //     Byte 0     : Brand/Manufacturer (8h)  -- 0xA8 for this sensor
@@ -517,7 +517,7 @@ void ccEnableAsyncOnGDO2() {
     ccWrite(RADIOLIB_CC1101_REG_FOCCFG, 0x3E);  // RADIOLIB_CC1101_REG_FOCCFG: Fast AFC Tracking
 
     // BSCFG (0x1A): ビット同期構成
-    // 走行中の 10.66kbps (93us) をCC1101にノイズ扱いさせず、
+    // 走行中フレーム(半ビット≈52us)をCC1101にノイズ扱いさせず、
     // ありのまま生データとしてGDO2にスルー出力させるため、ビット同期ループをリセット（ルーズ化）します。
     ccWrite(RADIOLIB_CC1101_REG_BSCFG, 0x10);  // RADIOLIB_CC1101_REG_BSCFG: Bit Synchronization Loop Gain Max
 
@@ -563,8 +563,9 @@ static inline int clampi(int v, int lo, int hi) {
 
 // ====== Pulse analysis (dual chip-rate) ======
 // Continental/日産センサーは状態によってチップレートが変わる:
-//   停止中(パークモード)  :  8192 chip/s -> 半ビット 122us
-//   走行中(ドライブモード): 公称 16384 chip/s(61us) だが実測は半ビット≈52us (51.2〜52.4us)
+//   停止中(パークモード)  : 半ビット 122us  ->  8192 chip/s -> 4096 bps
+//   走行中(ドライブモード): 半ビット ≈52us  -> ≈19.2k chip/s -> ≈9.6 kbps (実測 51.2〜52.4us)
+//   (chip/s = 1/半ビット長、bps = chip/s ÷ 2。外部情報の「16384bps」は実測と不一致)
 // ※「半ビット31us」と換算するとノイズ(平均dt≒28us)が合格し、CRC総当たりで偽ヒットを量産する。
 // 検出は中間の 56us で行い、実際の半ビット長はラン毎に実測(href)して追従する。
 // (href はデコードログに出るので、実車での真値確認に使える)
