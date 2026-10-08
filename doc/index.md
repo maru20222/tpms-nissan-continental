@@ -267,7 +267,8 @@ Brand バイトのステータス情報
 ──────────────────────────────────────────────────────────────────
 過去の誤認（記録）
 
-  ・外部情報の「16384bps」から half-bit を 31µs（bpsとして換算）/ 61µs（chip/sとして換算）
+  ・RTR-SDR blog v4 ＋ SDR++ で走行モードの電波を録音し、Universal Radio Hackerで61シンボル/Manchester IIで、ID 32bitのうち31bitが読めたため、16384bpsと判断した
+  ・16384bpsから half-bit を 31µs（bpsとして換算）/ 61µs（chip/sとして換算）
     と想定していたが、実測は約52µs（約19.2k chip/s、約9.6 kbps）。31µs 想定ではノイズが大量に通過し、
     CRC総当たりで他車IDの偽ヒットを量産していた。
   ・PARK と同じ 8バイト形式（Byte 7 = CRC）で検証していたため、
@@ -280,6 +281,11 @@ Brand バイトのステータス情報
 - PARK / DRIVE はラン検出の半ビット長で振り分ける（詳細は「GDO2エッジ取得とパケット検出」参照）
 - CRC は PARK形式（Byte 0〜6 → Byte 7）を先に試し、不一致なら DRIVE形式（Byte 0〜7 → Byte 8）を試す
 - DRIVE形式で一致したフレームはログに `DRIVE9 flags=xx` と表示される
+
+#### 録音時の記録
+![SDR](image/Record_SDR.jpg)
+![URH1](image/Record_URH1.png)
+![URH2](image/Record_URH2.png)
 
 #### 参考
 
