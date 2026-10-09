@@ -365,7 +365,7 @@ DevKitC-32E の**左列（J1）にまとめて配置**する。
     S3 版の割り当てを流用すると HSPI デフォルトの MISO=GPIO12 になり、
     現行ソフトの MISO 内部プルアップで**起動しなくなる**ため不可
   - GPIO0 / 2 / 15 : ブートモード・ログ出力選択
-  - GPIO5 は LCD の CS1 にのみ使用（出力専用、内部プルアップのまま起動に影響なし）
+  - GPIO5 は LCD1 の RST にのみ使用（出力専用。起動時は内部プルアップで High＝非リセットのため起動に影響なし）
 - **割り当ての考え方**
   - CC1101 の出力ピン（GDO0 / GDO2 / SO）は、起動時に ESP32 側が信号を出す可能性のある GPIO14 を避ける。
     GPIO14 は ESP32 → CC1101 方向の SCK に充てる（起動中は CSN=High なので CC1101 は無視する）
@@ -415,30 +415,32 @@ LCD は **VSPI（SPI3）の IO_MUX 直結ピン**（SCK=18 / MOSI=23）を使い
 | 7 | GND | — | |
 | 8 | GPIO19 | LCD2 DC | 第2LCD（右側） |
 | 9 | GPIO18 | LCD SCK (SCL) | VSPI IO_MUX、全LCD共有 |
-| 10 | GPIO5 | LCD CS | 第1LCD（左側） |
-| 11 | GPIO17 | LCD DC | 第1LCD（左側） |
-| 12 | GPIO16 | LCD RST | 第1LCD（左側） |
+| 10 | GPIO5 | LCD RST | 第1LCD（左側） |
+| 11 | GPIO17 | LCD CS | 第1LCD（左側） |
+| 12 | GPIO16 | LCD DC | 第1LCD（左側） |
 | 13 | GPIO4 | LCD BLK | Pch MOSFET ゲート（LOW=ON）。ゲートの 10kΩ プルアップで起動時 OFF を保証 |
 | 14 | GPIO0 | 使用しない | BOOT ボタン |
 | 15 | GPIO2 | 使用しない | ストラッピング |
 | 16 | GPIO15 | 使用しない | ストラッピング |
 | 17〜19 | SD1 / SD0 / CLK | 使用禁止 | Flash |
 
-- LCD 信号は 9本（SCK / MOSI / RST / DC / CS / BLK / RST2 / DC2 / CS2）＋ GND で、10P ボックスヘッダーにちょうど収まる
+- LCD 信号は 9本（SCK / MOSI / RST / DC / CS / BLK / RST2 / DC2 / CS2）＋ GND で、XH 10P コネクターにちょうど収まる
 - CC1101 信号は 6本。14P ボックスヘッダーで信号線の間に GND を挟む
 - 空き: GPIO13, GPIO35, GPIO36, GPIO39（36 / 39 は割り込み用途には使わない）
 
-### ボックスヘッダー ピン配置（案）
+### コネクター ピン配置（案）
 
 #### 前提
 
-- 両端コネクター付リボンケーブルは **1番ピン同士がつながる（ストレート）** 前提。
-  ケーブルの赤線（▼マーク）側が1番。**組立前にテスターで 1-1 / 2-2 を確認**すること
-- そのため、メイン基板側と子基板側は**同じ番号に同じ信号**を割り当てる
-- リボンケーブル上で隣り合う線は「番号が連続するピン」（1-2-3-4…）。
-  クロストーク対策はこの並びで考える
-- 電源（3.3V）はヘッダーに通さず、各基板へ XH コネクターで別供給（[本番用部品.md](../本番用部品.md) のとおり）
-- 下図は**部品面から見た図**（切り欠き上）。ユニバーサル基板の**はんだ面から配線するときは左右反転**する
+- CC1101 はボックスヘッダー＋両端コネクター付リボンケーブル、
+  LCD は C基板上にボックスヘッダーを置くスペースがないため **XH コネクター 10P（1列・2.5mmピッチ）＋コンタクト付コード**で接続する
+- どちらも **1番ピン同士がつながる（ストレート）** 前提。メイン基板側と子基板側は**同じ番号に同じ信号**を割り当てる
+  - リボンケーブル: 赤線（▼マーク）側が1番
+  - XH: コードを1本ずつハウジングに差すので、両端とも同じ番号の穴に差す（色で対応を管理）
+  - **組立前にテスターで 1-1 / 2-2 … を確認**すること
+- ケーブル上で隣り合う線は「番号が連続するピン」（1-2-3-4…）。クロストーク対策はこの並びで考える
+- 電源（3.3V）はコネクターに通さず、各基板へ XH 2P で別供給（[本番用部品.md](../本番用部品.md) のとおり）
+- 下図は**部品面から見た図**。ユニバーサル基板の**はんだ面から配線するときは左右反転**する
 
 #### CC1101 用 14P（2×7）: メイン基板側 / CC1101基板側 共通
 
@@ -483,49 +485,59 @@ LCD は **VSPI（SPI3）の IO_MUX 直結ピン**（SCK=18 / MOSI=23）を使い
 - CSN の 10kΩ プルアップは**CC1101基板側**（LDO 3.3V〜CSN 間）に置く。ケーブルが抜けていても CC1101 を非選択に保てる
 - CC1101 の VCC 直近に 0.1µF パスコン
 
-#### LCD 用 10P（2×5）: メイン基板側 / 液晶基板側 共通
+#### LCD 用 XH 10P（1×10）: メイン基板側 / 液晶基板側 共通
 
-信号 9本で GND は 1本しか取れないため、次の方針で並べる。
+使用部品: B10B-XH-A（トップ型ポスト）×2、XHP-10（ハウジング）×2、XH コンタクト付コード 10本
 
-- **SCK は GND（1番）の隣**の 2番に置き、反対隣は RST にする
-  （ST7789 のリセットは 10µs 以上の Low が必要なので、短いクロストークでは誤リセットしない）
-- 第1LCD（RST / MOSI / DC / CS）→ 第2LCD（RST2 / CS2 / DC2）→ BLK の順にまとめる
-- PWM で切り替わる BLK は端の 10番に置き、隣は DC2 にする（CS が High の間は DC が揺れても影響なし）
+1列なので、ケーブル上の隣接は番号の前後だけになる。信号 9本で GND は 1本しか取れないため、次の方針で並べる。
 
-部品面から見た図
+- **ESP32 の J3 の並び順（上から MOSI → RST2 → CS2 → DC2 → SCK → RST → CS → DC → BLK）と同じ順**に並べ、
+  メイン基板上の配線が交差しないようにする
+- **SCK の両隣を GND と RST** にする
+  - GND は J3 の並びとは関係なく GND バスから取れるので、SCK の隣（5番）に差し込む
+  - RST は動作中は High 固定。ST7789 のリセットは 10µs 以上の Low が必要なので、短いクロストークでは誤リセットしない
+- MOSI と SCK は隣接させない（MOSI は端の 1番、隣は静的な RST2）
+- PWM で切り替わる BLK は端の 10番に置き、隣は DC にする（DC は CS=Low 中の 8bit 目でしか読まれず、BLK の切替は低頻度）
+- 上記のため、第1LCD の GPIO 割り当てを RST=GPIO5 / CS=GPIO17 / DC=GPIO16 とする（J3 表・ソフトウェア設定に反映済み）
+
+部品面から見た図（ポストの開口部＝ハウジング差し込み側を手前）
 
 ```
-         【 切り欠き (上) 】
-  1:GND    3:RST    5:DC     7:RST2   9:DC2
-  2:SCK    4:MOSI   6:CS     8:CS2   10:BLK
+  1      2      3      4      5      6      7      8      9     10
+ MOSI  RST2   CS2    DC2    GND    SCK    RST    CS     DC     BLK
 ```
 
 はんだ面から見た図（左右反転）
 
 ```
-         【 切り欠き (上) 】
-  9:DC2    7:RST2   5:DC     3:RST    1:GND
- 10:BLK    8:CS2    6:CS     4:MOSI   2:SCK
+ 10      9      8      7      6      5      4      3      2      1
+ BLK    DC     CS     RST    SCK    GND    DC2    CS2   RST2   MOSI
 ```
 
 | ピン | 信号 | メイン基板側（ESP32） | 液晶基板側 | ケーブル上の両隣 |
 |------|------|----------------------|------------|------------------|
-| 1 | GND | GND（J3-1） | LCD1 / LCD2 GND | — / SCK |
-| 2 | SCK | GPIO18（J3-9） | LCD1 / LCD2 SCL | GND / RST |
-| 3 | RST | GPIO16（J3-12） | LCD1 RES | SCK / MOSI |
-| 4 | MOSI | GPIO23（J3-2） | LCD1 / LCD2 SDA | RST / DC |
-| 5 | DC | GPIO17（J3-11） | LCD1 DC | MOSI / CS |
-| 6 | CS | GPIO5（J3-10） | LCD1 CS | DC / RST2 |
-| 7 | RST2 | GPIO22（J3-3） | LCD2 RES | CS / CS2 |
-| 8 | CS2 | GPIO21（J3-6） | LCD2 CS | RST2 / DC2 |
-| 9 | DC2 | GPIO19（J3-8） | LCD2 DC | CS2 / BLK |
-| 10 | BLK | GPIO4（J3-13） | Pch MOSFET 経由で LCD1 / LCD2 BLK | DC2 / — |
+| 1 | MOSI | GPIO23（J3-2） | LCD1 / LCD2 SDA | — / RST2 |
+| 2 | RST2 | GPIO22（J3-3） | LCD2 RES | MOSI / CS2 |
+| 3 | CS2 | GPIO21（J3-6） | LCD2 CS | RST2 / DC2 |
+| 4 | DC2 | GPIO19（J3-8） | LCD2 DC | CS2 / GND |
+| 5 | GND | GND バス（または J3-7） | LCD1 / LCD2 GND | DC2 / SCK |
+| 6 | SCK | GPIO18（J3-9） | LCD1 / LCD2 SCL | GND / RST |
+| 7 | RST | GPIO5（J3-10） | LCD1 RES | SCK / CS |
+| 8 | CS | GPIO17（J3-11） | LCD1 CS | RST / DC |
+| 9 | DC | GPIO16（J3-12） | LCD1 DC | CS / BLK |
+| 10 | BLK | GPIO4（J3-13） | Pch MOSFET 経由で LCD1 / LCD2 BLK | DC / — |
 
-- J3 の並びとヘッダーの並びは一致しないため、メイン基板上で数本は交差する（AWG30/32 のジャンパーで逃がす）
+- XH ポストは J3 と平行に置き、J3-2〜J3-13 からそのまま横に引けば交差なし
+  （GND だけは GND バスから取る。J3-7 から直接引く場合も DC2 と1回交差するだけ）
+- XH は 2.5mm ピッチなので、2.54mm ピッチのユニバーサル基板では 10P 両端で約 0.36mm ずれる。
+  端のピンを少し寄せて差し込む
+- コードはバラ線なので、ハウジングから**番号順に並べたまま束ねる**（途中で入れ替わると上記の隣接関係が崩れる）。
+  余裕があれば SCK と GND の2本だけ軽く撚り合わせると、SCK のループ面積が小さくなりさらに良い
 - Pch MOSFET（ZVP2106A）・ゲート抵抗 100Ω・ゲートプルアップ 10kΩ は**液晶基板側**に置く想定。
   ケーブルが抜けてもバックライトが OFF のままになる
 - GND が1本しかないので、ケーブルはできるだけ短くし、SPI クロックは 40MHz から始めて表示が乱れたら下げる
-- GND を増やしたい場合は、RST と RST2 を1本にまとめて（両LCDを同時リセット）空いたピンを GND にする
+- GND を増やしたい場合は、RST と RST2 を1本にまとめて（両LCDを同時リセット）空いたピンを GND にし、
+  SCK を GND で挟む（… DC2 / GND / SCK / GND / CS …）
 
 ### ソフトウェア設定
 
@@ -542,9 +554,9 @@ static const int PIN_GDO2 = 33;   // CC1101 pin8 GDO2 (Async Data)
 // LCD  VSPI (IO_MUX 直結ピン)
 #define LCD_SCK   18   // VSPI SCK
 #define LCD_MOSI  23   // VSPI MOSI
-#define LCD_RST   16   // 第1LCD RST
-#define LCD_DC    17   // 第1LCD DC
-#define LCD_CS     5   // 第1LCD CS
+#define LCD_RST    5   // 第1LCD RST
+#define LCD_DC    16   // 第1LCD DC
+#define LCD_CS    17   // 第1LCD CS
 #define LCD_BLK    4   // バックライト（全LCD共用、LOW=ON）
 #define LCD2_RST  22   // 第2LCD RST
 #define LCD2_DC   19   // 第2LCD DC
