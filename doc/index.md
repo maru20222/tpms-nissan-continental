@@ -41,6 +41,45 @@ static const int PIN_MISO = 13;   // CC1101 pin7 MISO
 static const int PIN_GDO0 = 16;   // CC1101 pin3 GDO0 (Carrier Sense)
 static const int PIN_GDO2 = 15;   // CC1101 pin8 GDO2 (Async Data)
 ```
+### ピン接続（ESP32-S3 ← → M154-240240-RGB）
+
+CC1101 とは**独立した SPI3 バス**を使用（速度設定の切り替え不要、干渉なし）。
+
+| M154 ピン | 機能 | ESP32-S3 GPIO | 備考 |
+|-----------|------|---------------|------|
+| VCC | 電源 | 3.3V | |
+| GND | グランド | GND | |
+| SCL | SPI クロック | GPIO17 | SPI3 専用（全LCD共有）|
+| SDA | SPI MOSI | GPIO18 | SPI3 専用（全LCD共有）|
+| RES | ハードリセット | GPIO4 | 第1LCD（左側、既存）|
+| DC | データ/コマンド | GPIO5 | 第1LCD（左側、既存）|
+| CS | チップセレクト | GPIO6 | 第1LCD（左側、既存）|
+| BLK | バックライト | GPIO7 | 全LCD共用、Pch MOSFET(ZVP2106A) 高側スイッチで **LOW=ON**（PWM 調光可、起動時 OFF）|
+
+右側用に追加する第2台LCDの制御ピン：
+
+| 信号 | 第2LCD（右側） 推奨 GPIO | 備考 |
+|------|------------------------|------|
+| RES2 | GPIO19 | 第2LCD（右側）のハードリセット |
+| DC2  | GPIO21 | 第2LCD（右側）の D/C |
+| CS2  | GPIO20 | 第2LCD（右側）の CS |
+
+
+### ソフトウェア設定
+
+```cpp
+#define LCD_SCK   17   // SPI3 専用
+#define LCD_MOSI  18   // SPI3 専用
+#define LCD_RST    4    // 第1LCD RST
+#define LCD_DC     5    // 第1LCD DC
+#define LCD_CS     6    // 第1LCD CS
+#define LCD_BLK    7    // バックライト（全LCD共用）
+
+// 追加LCD用（推奨）
+#define LCD2_RST   19   // 第2LCD RST
+#define LCD2_DC    21   // 第2LCD DC
+#define LCD2_CS   20    // 第2LCD CS
+```
 
 ### 動作モード
 
@@ -298,6 +337,224 @@ Brand バイトのステータス情報
 
 
 ---
+## CC1101とESP32-DevKitC-32E ピン対応表（本番機・案）
+
+### SPI接続
+
+CC1101 は **HSPI（SPI2）** を GPIO マトリクス経由で使用（SPI クロック 500kHz なので速度制約なし）。
+DevKitC-32E の**左列（J1）にまとめて配置**する。
+
+| CC1101 ピン番号 | CC1101 機能 | ESP32 GPIO | J1 位置 | 説明 |
+|----------------|------------|------------|---------|------|
+| 1 | GND | GND | J1-14 | グランド |
+| 2 | VCC | — | — | 外部LDO（NJU7223F33）の 3.3V から供給 |
+| 3 | GDO0 | GPIO32 | J1-7 | キャリアセンス（現行ソフトでは配線診断のみ） |
+| 4 | CSN | GPIO27 | J1-11 | SPI チップセレクト。**10kΩ で 3.3V へプルアップ**推奨 |
+| 5 | SCK | GPIO14 | J1-12 | SPI クロック |
+| 6 | MOSI (SI) | GPIO26 | J1-10 | SPI データ (Master Out Slave In) |
+| 7 | MISO (SO) | GPIO25 | J1-9 | SPI データ (Master In Slave Out)、内部プルアップ使用 |
+| 8 | GDO2 | GPIO33 | J1-8 | 非同期データ出力（CHANGE 割り込み） |
+
+### 備考
+
+- **使用禁止ピン**
+  - GPIO6〜11 : SPI Flash 接続（DevKitC の SD0〜SD3 / CMD / CLK）
+  - GPIO1 / 3 : UART0（USB シリアルログ用）
+- **使用を避けたピン（ストラッピング）**
+  - GPIO12 (MTDI) : 起動時 High だと Flash 電圧が 1.8V になり起動不能。
+    S3 版の割り当てを流用すると HSPI デフォルトの MISO=GPIO12 になり、
+    現行ソフトの MISO 内部プルアップで**起動しなくなる**ため不可
+  - GPIO0 / 2 / 15 : ブートモード・ログ出力選択
+  - GPIO5 は LCD の CS1 にのみ使用（出力専用、内部プルアップのまま起動に影響なし）
+- **割り当ての考え方**
+  - CC1101 の出力ピン（GDO0 / GDO2 / SO）は、起動時に ESP32 側が信号を出す可能性のある GPIO14 を避ける。
+    GPIO14 は ESP32 → CC1101 方向の SCK に充てる（起動中は CSN=High なので CC1101 は無視する）
+  - CSN は ESP32 リセット中〜初期化前にフローティングになるため、外付けプルアップで非選択に固定する
+  - GDO2 は割り込みを使うので GPIO36 / 39 を避ける（Wi-Fi/ADC 動作時に偽エッジが出るエラッタあり）
+  - アナログ入力は ADC1（GPIO32〜39）のみ使う（ADC2 は Wi-Fi 使用中に読めない）
+  - GPIO16 / 17 は WROOM-32E では使用可（WROVER-E では PSRAM に使われるため不可）
+- **電源** : CC1101・LCD とも外部LDO（NJU7223F33）の 3.3V から供給。ESP32 の 3V3 ピンとは接続しない（GND は共通）
+
+#### ピン割り当て全体（案）
+
+LCD・照度センサーを含めた全体の割り当て。CC1101 は左列（J1）、LCD は右列（J3）に分けて配線の交差を避ける。
+LCD は **VSPI（SPI3）の IO_MUX 直結ピン**（SCK=18 / MOSI=23）を使い、最大 80MHz まで出せるようにする。
+
+左列 J1（アンテナ側から）
+
+| J1 | ピン | 割り当て | 備考 |
+|----|------|----------|------|
+| 1 | 3V3 | — | 未使用（外部LDO系とは接続しない） |
+| 2 | EN | — | |
+| 3 | GPIO36 (SVP) | 空き | 入力専用・ADC1 |
+| 4 | GPIO39 (SVN) | 空き | 入力専用・ADC1 |
+| 5 | GPIO34 | 照度センサー（NJL7502L） | 入力専用・ADC1_CH6 |
+| 6 | GPIO35 | 空き（予備: 車載電源電圧監視など） | 入力専用・ADC1_CH7 |
+| 7 | GPIO32 | CC1101 GDO0 | |
+| 8 | GPIO33 | CC1101 GDO2 | 割り込み |
+| 9 | GPIO25 | CC1101 MISO | |
+| 10 | GPIO26 | CC1101 MOSI | |
+| 11 | GPIO27 | CC1101 CSN | 10kΩ プルアップ |
+| 12 | GPIO14 | CC1101 SCK | |
+| 13 | GPIO12 | 使用しない | ストラッピング |
+| 14 | GND | CC1101 GND | |
+| 15 | GPIO13 | 空き | |
+| 16〜18 | SD2 / SD3 / CMD | 使用禁止 | Flash |
+| 19 | 5V | 電源入力 | ショットキー経由で DCDC 5V |
+
+右列 J3（アンテナ側から）
+
+| J3 | ピン | 割り当て | 備考 |
+|----|------|----------|------|
+| 1 | GND | LCD GND | |
+| 2 | GPIO23 | LCD MOSI (SDA) | VSPI IO_MUX、全LCD共有 |
+| 3 | GPIO22 | LCD2 RST | 第2LCD（右側） |
+| 4 | TXD0 | 使用しない | USB シリアル |
+| 5 | RXD0 | 使用しない | USB シリアル |
+| 6 | GPIO21 | LCD2 CS | 第2LCD（右側） |
+| 7 | GND | — | |
+| 8 | GPIO19 | LCD2 DC | 第2LCD（右側） |
+| 9 | GPIO18 | LCD SCK (SCL) | VSPI IO_MUX、全LCD共有 |
+| 10 | GPIO5 | LCD CS | 第1LCD（左側） |
+| 11 | GPIO17 | LCD DC | 第1LCD（左側） |
+| 12 | GPIO16 | LCD RST | 第1LCD（左側） |
+| 13 | GPIO4 | LCD BLK | Pch MOSFET ゲート（LOW=ON）。ゲートの 10kΩ プルアップで起動時 OFF を保証 |
+| 14 | GPIO0 | 使用しない | BOOT ボタン |
+| 15 | GPIO2 | 使用しない | ストラッピング |
+| 16 | GPIO15 | 使用しない | ストラッピング |
+| 17〜19 | SD1 / SD0 / CLK | 使用禁止 | Flash |
+
+- LCD 信号は 9本（SCK / MOSI / RST / DC / CS / BLK / RST2 / DC2 / CS2）＋ GND で、10P ボックスヘッダーにちょうど収まる
+- CC1101 信号は 6本。14P ボックスヘッダーで信号線の間に GND を挟む
+- 空き: GPIO13, GPIO35, GPIO36, GPIO39（36 / 39 は割り込み用途には使わない）
+
+### ボックスヘッダー ピン配置（案）
+
+#### 前提
+
+- 両端コネクター付リボンケーブルは **1番ピン同士がつながる（ストレート）** 前提。
+  ケーブルの赤線（▼マーク）側が1番。**組立前にテスターで 1-1 / 2-2 を確認**すること
+- そのため、メイン基板側と子基板側は**同じ番号に同じ信号**を割り当てる
+- リボンケーブル上で隣り合う線は「番号が連続するピン」（1-2-3-4…）。
+  クロストーク対策はこの並びで考える
+- 電源（3.3V）はヘッダーに通さず、各基板へ XH コネクターで別供給（[本番用部品.md](../本番用部品.md) のとおり）
+- 下図は**部品面から見た図**（切り欠き上）。ユニバーサル基板の**はんだ面から配線するときは左右反転**する
+
+#### CC1101 用 14P（2×7）: メイン基板側 / CC1101基板側 共通
+
+奇数ピンを全部 GND にして、ケーブル上で全信号線の両隣を GND にする。
+信号の並びは ESP32 の J1 の並び（GDO0→GDO2→MISO→MOSI→CSN→SCK）と同じにして、メイン基板上の配線が交差しないようにする。
+クロック（SCK）は最も敏感な GDO2 から最も遠い位置にする。
+
+部品面から見た図
+
+```
+           【 切り欠き (上) 】
+  1:GND    3:GND    5:GND    7:GND    9:GND   11:GND   13:GND
+  2:GDO0   4:GDO2   6:MISO   8:MOSI  10:CSN   12:SCK   14:GND
+```
+
+はんだ面から見た図（左右反転）
+
+```
+           【 切り欠き (上) 】
+ 13:GND   11:GND    9:GND    7:GND    5:GND    3:GND    1:GND
+ 14:GND   12:SCK   10:CSN    8:MOSI   6:MISO   4:GDO2   2:GDO0
+```
+
+| ピン | 信号 | メイン基板側（ESP32） | CC1101基板側（CC1101 ピン） | ケーブル上の両隣 |
+|------|------|----------------------|----------------------------|------------------|
+| 1 | GND | GND（J1-14） | 1 GND | — / GDO0 |
+| 2 | GDO0 | GPIO32（J1-7） | 3 GDO0 | GND / GND |
+| 3 | GND | GND | 1 GND | GDO0 / GDO2 |
+| 4 | GDO2 | GPIO33（J1-8） | 8 GDO2 | GND / GND |
+| 5 | GND | GND | 1 GND | GDO2 / MISO |
+| 6 | MISO | GPIO25（J1-9） | 7 SO | GND / GND |
+| 7 | GND | GND | 1 GND | MISO / MOSI |
+| 8 | MOSI | GPIO26（J1-10） | 6 SI | GND / GND |
+| 9 | GND | GND | 1 GND | MOSI / CSN |
+| 10 | CSN | GPIO27（J1-11）＋10kΩプルアップ | 4 CSN | GND / GND |
+| 11 | GND | GND | 1 GND | CSN / SCK |
+| 12 | SCK | GPIO14（J1-12） | 5 SCK | GND / GND |
+| 13 | GND | GND | 1 GND | SCK / GND |
+| 14 | GND | GND | 1 GND | GND / — |
+
+- 奇数列（上段）が全部 GND なので、基板上は上段を1本の GND バスでつなげばよい
+- CSN の 10kΩ プルアップは**CC1101基板側**（LDO 3.3V〜CSN 間）に置く。ケーブルが抜けていても CC1101 を非選択に保てる
+- CC1101 の VCC 直近に 0.1µF パスコン
+
+#### LCD 用 10P（2×5）: メイン基板側 / 液晶基板側 共通
+
+信号 9本で GND は 1本しか取れないため、次の方針で並べる。
+
+- **SCK は GND（1番）の隣**の 2番に置き、反対隣は RST にする
+  （ST7789 のリセットは 10µs 以上の Low が必要なので、短いクロストークでは誤リセットしない）
+- 第1LCD（RST / MOSI / DC / CS）→ 第2LCD（RST2 / CS2 / DC2）→ BLK の順にまとめる
+- PWM で切り替わる BLK は端の 10番に置き、隣は DC2 にする（CS が High の間は DC が揺れても影響なし）
+
+部品面から見た図
+
+```
+         【 切り欠き (上) 】
+  1:GND    3:RST    5:DC     7:RST2   9:DC2
+  2:SCK    4:MOSI   6:CS     8:CS2   10:BLK
+```
+
+はんだ面から見た図（左右反転）
+
+```
+         【 切り欠き (上) 】
+  9:DC2    7:RST2   5:DC     3:RST    1:GND
+ 10:BLK    8:CS2    6:CS     4:MOSI   2:SCK
+```
+
+| ピン | 信号 | メイン基板側（ESP32） | 液晶基板側 | ケーブル上の両隣 |
+|------|------|----------------------|------------|------------------|
+| 1 | GND | GND（J3-1） | LCD1 / LCD2 GND | — / SCK |
+| 2 | SCK | GPIO18（J3-9） | LCD1 / LCD2 SCL | GND / RST |
+| 3 | RST | GPIO16（J3-12） | LCD1 RES | SCK / MOSI |
+| 4 | MOSI | GPIO23（J3-2） | LCD1 / LCD2 SDA | RST / DC |
+| 5 | DC | GPIO17（J3-11） | LCD1 DC | MOSI / CS |
+| 6 | CS | GPIO5（J3-10） | LCD1 CS | DC / RST2 |
+| 7 | RST2 | GPIO22（J3-3） | LCD2 RES | CS / CS2 |
+| 8 | CS2 | GPIO21（J3-6） | LCD2 CS | RST2 / DC2 |
+| 9 | DC2 | GPIO19（J3-8） | LCD2 DC | CS2 / BLK |
+| 10 | BLK | GPIO4（J3-13） | Pch MOSFET 経由で LCD1 / LCD2 BLK | DC2 / — |
+
+- J3 の並びとヘッダーの並びは一致しないため、メイン基板上で数本は交差する（AWG30/32 のジャンパーで逃がす）
+- Pch MOSFET（ZVP2106A）・ゲート抵抗 100Ω・ゲートプルアップ 10kΩ は**液晶基板側**に置く想定。
+  ケーブルが抜けてもバックライトが OFF のままになる
+- GND が1本しかないので、ケーブルはできるだけ短くし、SPI クロックは 40MHz から始めて表示が乱れたら下げる
+- GND を増やしたい場合は、RST と RST2 を1本にまとめて（両LCDを同時リセット）空いたピンを GND にする
+
+### ソフトウェア設定
+
+```cpp
+// CC1101 (src/main.cpp)  HSPI を GPIO マトリクス経由で使用
+static SPIClass cc1101Spi(HSPI);
+static const int PIN_CS   = 27;   // CC1101 pin4 CSN（外付け10kΩプルアップ）
+static const int PIN_SCK  = 14;   // CC1101 pin5 SCK
+static const int PIN_MOSI = 26;   // CC1101 pin6 MOSI
+static const int PIN_MISO = 25;   // CC1101 pin7 MISO
+static const int PIN_GDO0 = 32;   // CC1101 pin3 GDO0 (Carrier Sense)
+static const int PIN_GDO2 = 33;   // CC1101 pin8 GDO2 (Async Data)
+
+// LCD  VSPI (IO_MUX 直結ピン)
+#define LCD_SCK   18   // VSPI SCK
+#define LCD_MOSI  23   // VSPI MOSI
+#define LCD_RST   16   // 第1LCD RST
+#define LCD_DC    17   // 第1LCD DC
+#define LCD_CS     5   // 第1LCD CS
+#define LCD_BLK    4   // バックライト（全LCD共用、LOW=ON）
+#define LCD2_RST  22   // 第2LCD RST
+#define LCD2_DC   19   // 第2LCD DC
+#define LCD2_CS   21   // 第2LCD CS
+
+// 照度センサー
+#define PIN_LIGHT 34   // NJL7502L（ADC1_CH6）
+```
+
+---
 
 ## LCD ハードウェア構成
 
@@ -312,45 +569,6 @@ Brand バイトのステータス情報
 | 電源 | 3.3V |
 | 購入日 | 2026-04-04 |
 
-### ピン接続（ESP32-S3 ← → M154-240240-RGB）
-
-CC1101 とは**独立した SPI3 バス**を使用（速度設定の切り替え不要、干渉なし）。
-
-| M154 ピン | 機能 | ESP32-S3 GPIO | 備考 |
-|-----------|------|---------------|------|
-| VCC | 電源 | 3.3V | |
-| GND | グランド | GND | |
-| SCL | SPI クロック | GPIO17 | SPI3 専用（全LCD共有）|
-| SDA | SPI MOSI | GPIO18 | SPI3 専用（全LCD共有）|
-| RES | ハードリセット | GPIO4 | 第1LCD（左側、既存）|
-| DC | データ/コマンド | GPIO5 | 第1LCD（左側、既存）|
-| CS | チップセレクト | GPIO6 | 第1LCD（左側、既存）|
-| BLK | バックライト | GPIO7 | 全LCD共用、Pch MOSFET(ZVP2106A) 高側スイッチで **LOW=ON**（PWM 調光可、起動時 OFF）|
-
-右側用に追加する第2台LCDの制御ピン：
-
-| 信号 | 第2LCD（右側） 推奨 GPIO | 備考 |
-|------|------------------------|------|
-| RES2 | GPIO19 | 第2LCD（右側）のハードリセット |
-| DC2  | GPIO21 | 第2LCD（右側）の D/C |
-| CS2  | GPIO20 | 第2LCD（右側）の CS |
-
-
-### ソフトウェア設定
-
-```cpp
-#define LCD_SCK   17   // SPI3 専用
-#define LCD_MOSI  18   // SPI3 専用
-#define LCD_RST    4    // 第1LCD RST
-#define LCD_DC     5    // 第1LCD DC
-#define LCD_CS     6    // 第1LCD CS
-#define LCD_BLK    7    // バックライト（全LCD共用）
-
-// 追加LCD用（推奨）
-#define LCD2_RST   19   // 第2LCD RST
-#define LCD2_DC    21   // 第2LCD DC
-#define LCD2_CS   20    // 第2LCD CS
-```
 
 ### ライブラリ: Adafruit ST7789 Library, GFX Library
 
