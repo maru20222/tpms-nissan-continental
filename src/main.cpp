@@ -1474,7 +1474,7 @@ void loop() {
       static uint32_t lastStrongMs = 0;
       if (r > -90 && (millis() - lastStrongMs) >= 200) {
         lastStrongMs = millis();
-        Serial.printf("  [Strong] rssi=%d dBm\n", r);
+        if (ENABLE_DETAILED_LOG) Serial.printf("  [Strong] rssi=%d dBm\n", r);
       }
       if (r < rssiMin) rssiMin = r;
       if (r > rssiMax) rssiMax = r;
