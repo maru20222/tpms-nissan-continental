@@ -6,7 +6,8 @@
 //   Nissan part: 40700-4GA0B
 //   Build env switch: TPMS_ENV_DEV (see below)
 //   PROD IDs (Autel MX-Sensor):
-//     FL:11111111  FR:22222222  RL:33333333  RR:44444444
+//     FL:B8B333A8  FR:F9270F4E  RL:B610A9F7  RR:803468B6
+//     (bit-shift/invert alias distance >= 6, see backup/id_alias_check.py)
 //   DEV IDs (original OEM sensors):
 //     FL:AE5C32C8  FR:AC4ACC28  RL:AE58E836  RR:AC4CCF67
 //
@@ -33,7 +34,7 @@
 
 // ====== Build environment: dev / prod ======
 // TPMS_ENV_DEV = 1 : dev  (original OEM sensors: AE5C32C8 ...)
-// TPMS_ENV_DEV = 0 : prod (Autel MX-Sensors:     11111111 ...)
+// TPMS_ENV_DEV = 0 : prod (Autel MX-Sensors:     B8B333A8 ...)
 // Override from platformio.ini with e.g. build_flags = -DTPMS_ENV_DEV=0
 #ifndef ENABLE_DESK_TEST
 #define ENABLE_DESK_TEST false
@@ -82,11 +83,13 @@ static const KnownSensor KNOWN_SENSORS[] = {
 };
 #else
 // prod: Autel MX-Sensors
+// 旧ID 11111111/22222222/33333333/44444444 はビットずれ・反転で互いに(自身にも)
+// 完全一致してしまうため、誤認しにくいIDに変更した（backup/id_alias_check.py で評価）。
 static const KnownSensor KNOWN_SENSORS[] = {
-  { 0x11111111, 0, "FL:40700-4GA0B" },  // FL
-  { 0x22222222, 2, "FR:40700-4GA0B" },  // FR
-  { 0x33333333, 1, "RL:40700-4GA0B" },  // RL
-  { 0x44444444, 3, "RR:40700-4GA0B" },  // RR
+  { 0xB8B333A8, 0, "FL:40700-4GA0B" },  // FL
+  { 0xF9270F4E, 2, "FR:40700-4GA0B" },  // FR
+  { 0xB610A9F7, 1, "RL:40700-4GA0B" },  // RL
+  { 0x803468B6, 3, "RR:40700-4GA0B" },  // RR
 };
 #endif
 static const int KNOWN_SENSOR_COUNT = (int)(sizeof(KNOWN_SENSORS) / sizeof(KNOWN_SENSORS[0]));
@@ -932,6 +935,11 @@ struct RunDecode {
 
 enum { RUN_NONE = 0, RUN_CRC_OK = 1, RUN_ID_HIT = 2 };
 
+// 1ラン内で「別の自車ID」が同時に候補に挙がった回数（ビットずれ別名による誤認防止で破棄）。
+// 例: 0x44444444 を1ビット早く読むと brand の LSB=0 なら 0x22222222 になり、
+//     圧力は P/2、温度も崩れた値になる。CRC-8 は 1/256 で偶然一致し得る。
+static uint32_t g_cntAmbiguous = 0;
+
 // 半ビット公称値 hNom のパルス連続区間(ラン)をデコードする。
 // RUN_CRC_OK : 自車センサーID かつ CRC/範囲チェック合格
 // RUN_ID_HIT : 自車センサーID が32bit完全一致したが CRC 不一致（呼び出し側で繰返し確認）
@@ -988,6 +996,10 @@ static int decodeRun(const Pulse* p, int n, int hNom, RunDecode* res, bool diag)
   ContinentalTPMSData hitData = {};
   int hitHs = 0, hitErasures = 0, hitParity = 0, hitInv = 0, hitBo = 0;
   float hitIr = 2.0f;
+  // ビットずれ別名の検出用（同一ラン内に異なる自車IDが現れたら曖昧として破棄）
+  bool anyValid = false, validAmbig = false;
+  bool anyHit = false, hitAmbig = false;
+  uint32_t validId0 = 0, hitId0 = 0;
 
   for (int parity = 0; parity <= 1; parity++) {
     for (int inv = 0; inv <= 1; inv++) {
@@ -1024,6 +1036,8 @@ static int decodeRun(const Pulse* p, int n, int hNom, RunDecode* res, bool diag)
             }
           }
           if (!d.valid) {
+            if (!anyHit) { anyHit = true; hitId0 = d.sensorId; }
+            else if (d.sensorId != hitId0) hitAmbig = true;
             float ir = manchesterInvalidRate(half + hs, halfN - hs, 64);
             if (!hit || ir < hitIr) {
               hit = true; hitIr = ir; hitData = d; hitHs = hs;
@@ -1041,6 +1055,8 @@ static int decodeRun(const Pulse* p, int n, int hNom, RunDecode* res, bool diag)
           }
           continue;
         }
+        if (!anyValid) { anyValid = true; validId0 = d.sensorId; }
+        else if (d.sensorId != validId0) validAmbig = true;
         if (!found || ir < bestIr) {
           found  = true;
           bestIr = ir;
@@ -1062,9 +1078,24 @@ static int decodeRun(const Pulse* p, int n, int hNom, RunDecode* res, bool diag)
     res->preambleScore = score;
   }
 
+  if (found && validAmbig) {
+    g_cntAmbiguous++;
+    if (ENABLE_DETAILED_LOG) {
+      Serial.printf("  [Ambiguous] h=%d CRC-OK IDs %08X / %08X in same run -> dropped\n",
+                    hNom, validId0, res->data.sensorId);
+    }
+    return RUN_NONE;
+  }
+
   if (found) {
     res->ir = bestIr;
     return RUN_CRC_OK;
+  }
+
+  if (hit && hitAmbig) {
+    // CRC NG の別名同士は繰返し確認でも同じ誤りを再現してしまうので採用しない
+    g_cntAmbiguous++;
+    return RUN_NONE;
   }
 
   if (hit) {
@@ -1199,6 +1230,47 @@ static uint32_t g_cntOverflow = 0, g_cntRxKick = 0;
 static int      g_maxRunLen = 0;
 static int      g_decodedRssiMax = -127;
 
+// ====== LCD 急変ゲート ======
+// 表示中の値から大きく飛んだ値は、別パケットでもう1回同じ値が来るまで表示しない。
+// 本物の変化ならバースト内の繰返し送信ですぐ確認が取れ、偶発的な誤デコードは再現しない。
+static const float    JUMP_PSI        = 3.0f;    // 約0.2bar
+static const float    JUMP_TEMP_C     = 10.0f;
+static const float    AGREE_PSI       = 1.0f;
+static const float    AGREE_TEMP_C    = 3.0f;
+static const uint32_t JUMP_CONFIRM_MS = 180000;
+
+struct JumpPending {
+  bool     active;
+  float    psi;
+  float    tempC;
+  uint32_t ms;
+};
+static JumpPending g_jumpPend[LCD_SENSOR_COUNT] = {};
+static uint32_t g_cntJumpHold = 0;
+
+static bool acceptLcdUpdate(int slot, const ContinentalTPMSData& d) {
+  const TireState& cur = g_tireState[slot];
+  JumpPending& pd = g_jumpPend[slot];
+  if (!cur.valid) { pd.active = false; return true; }
+
+  bool jump = fabsf(d.pressurePsi - cur.psi) > JUMP_PSI ||
+              fabsf(d.temperatureC - cur.temperatureC) > JUMP_TEMP_C;
+  if (!jump) { pd.active = false; return true; }
+
+  uint32_t now = millis();
+  if (pd.active && (uint32_t)(now - pd.ms) <= JUMP_CONFIRM_MS &&
+      fabsf(d.pressurePsi - pd.psi) <= AGREE_PSI &&
+      fabsf(d.temperatureC - pd.tempC) <= AGREE_TEMP_C) {
+    pd.active = false;
+    return true;
+  }
+  pd.active = true;
+  pd.psi    = d.pressurePsi;
+  pd.tempC  = d.temperatureC;
+  pd.ms     = now;
+  return false;
+}
+
 static void handleDecoded(const RunDecode& rd, int hNom, int runLen) {
   // 窓の重なりで同じパケットを二度デコードしたものを捨てる
   static uint32_t recentId[8] = {};
@@ -1241,6 +1313,13 @@ static void handleDecoded(const RunDecode& rd, int hNom, int runLen) {
   // ---- LCD update (CRC verified = trusted) ----
   int lcdSlot = sensorRecords[recIdx].lcdSlot;
   if (lcdSlot >= 0 && lcdSlot < LCD_SENSOR_COUNT) {
+    if (!acceptLcdUpdate(lcdSlot, d)) {
+      g_cntJumpHold++;
+      Serial.printf("  [HOLD] slot=%d jump %.1fPSI/%.0fC -> %.1fPSI/%.0fC (wait confirm)\n",
+                    lcdSlot, g_tireState[lcdSlot].psi, g_tireState[lcdSlot].temperatureC,
+                    d.pressurePsi, d.temperatureC);
+      return;
+    }
     lcdUpdateTire(lcdSlot, d.sensorId,
                   d.pressurePsi, d.pressureBar,
                   d.pressureKpa, d.temperatureC);
@@ -1496,6 +1575,8 @@ void loop() {
                     g_maxRunLen, (unsigned long)g_cntIdHit, (unsigned long)g_cntIdHitConfirmed,
                     (unsigned long)g_cntOverflow,
                     (unsigned long)g_cntRxKick, (unsigned long)g_radioLostCount);
+      Serial.printf("    ambiguous(alias)=%lu  jumpHold=%lu\n",
+                    (unsigned long)g_cntAmbiguous, (unsigned long)g_cntJumpHold);
       Serial.printf("    RSSI min=%d avg=%d max=%d dBm (n=%d)  decoded peak=%d dBm\n",
                     (rssiCnt ? rssiMin : 0), (rssiCnt ? (int)(rssiSum / rssiCnt) : 0),
                     (rssiCnt ? rssiMax : 0), rssiCnt, g_decodedRssiMax);
@@ -1510,6 +1591,7 @@ void loop() {
       g_cntDecDrive = 0; g_cntDecPark = 0; g_cntDup = 0;
       g_cntOverflow = 0; g_cntRxKick = 0; g_maxRunLen = 0;
       g_cntIdHit = 0; g_cntIdHitConfirmed = 0;
+      g_cntAmbiguous = 0; g_cntJumpHold = 0;
       g_decodedRssiMax = -127;
       rssiMin = 127; rssiMax = -127; rssiSum = 0; rssiCnt = 0;
     }
